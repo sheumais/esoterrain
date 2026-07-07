@@ -1,0 +1,8 @@
+[package]
+name = "esoland"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+image = { version = "0.24", default-features = false, features = ["png"] }
+walkdir = "2"
