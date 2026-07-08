@@ -37,7 +37,7 @@ fn decode_cell_from_fileid(file_id: u64, world: u32) -> Option<(u32, u32)> {
     Some((low >> 16, low & 0xFFFF))
 }
 
-fn parse_int(s: &str) -> Option<i64> {
+pub fn parse_int(s: &str) -> Option<i64> {
     let s = s.trim();
     if s.is_empty() {
         return None;
@@ -99,4 +99,60 @@ pub fn filter_manifest(manifest_path: &str, world: u32) -> io::Result<ManifestRe
         toc_matches,
         cell_matches,
     })
+}
+
+pub const COLOURMAP_TYPE_NORMAL: u32 = 0x0C;
+pub const COLOURMAP_TYPE_OVERLAY: u32 = 0x0D;
+
+fn colourmap_high(world: u32, ty: u32) -> u32 {
+    0x4000_0000u32 | ((world & WORLD_MASK) << 5) | (ty & TYPE_MASK)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ColourMapMatch {
+    pub index: u32,
+    pub x: u32,
+    pub z: u32,
+    pub overlay: bool,
+    pub arch: u32,
+}
+
+pub fn filter_colourmap_manifest(manifest_path: &str, world: u32) -> io::Result<Vec<ColourMapMatch>> {
+    let target_normal = colourmap_high(world, COLOURMAP_TYPE_NORMAL);
+    let target_overlay = colourmap_high(world, COLOURMAP_TYPE_OVERLAY);
+
+    let mut matches = Vec::new();
+    let content = std::fs::read_to_string(manifest_path)?;
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
+        if row.len() < 11 {
+            continue;
+        }
+        let (index, file_index, unk1, arch) = match (
+            parse_int(row[0]), parse_int(row[2]), parse_int(row[3]), parse_int(row[9]),
+        ) {
+            (Some(i), Some(fi), Some(u), Some(a)) => (i as u32, fi as u32, u as u32, a as u32),
+            _ => continue,
+        };
+
+        let overlay = if unk1 == target_normal {
+            false
+        } else if unk1 == target_overlay {
+            true
+        } else {
+            continue;
+        };
+
+        matches.push(ColourMapMatch {
+            index,
+            x: file_index >> 16,
+            z: file_index & 0xFFFF,
+            overlay,
+            arch,
+        });
+    }
+    Ok(matches)
 }
