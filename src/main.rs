@@ -12,6 +12,7 @@ use std::path::Path;
 use walkdir::WalkDir;
 
 use crate::colourmap::{ColourMapGrid};
+use crate::landfile::save_rgba_from_channels;
 use crate::manifest::filter_colourmap_manifest;
 
 const DEFAULT_EXE: &str = "C:/Users/H/Documents/EsoExtractData v0.53/EsoExtractData.exe";
@@ -279,6 +280,7 @@ fn main() {
     println!("\nReading cell files and accumulating raw channel data...");
     let mut scalar_images: HashMap<usize, RawBigImage> = HashMap::new();
     let mut vec3_images: HashMap<usize, (RawBigImage, RawBigImage, RawBigImage)> = HashMap::new();
+    let mut planes4_images: HashMap<usize, (RawBigImage, RawBigImage, RawBigImage, RawBigImage)> = HashMap::new();
     let mut loaded_per_channel: HashMap<usize, usize> = HashMap::new();
     let mut files_loaded = 0usize;
     let mut errors = 0usize;
@@ -346,6 +348,23 @@ fn main() {
                                 *loaded_per_channel.entry(channel).or_insert(0) += 1;
                             }
                         }
+                        Some(RawTile::Planes4 { p0, p1, p2, p3, width, height }) => {
+                            let (i0, i1, i2, i3) = planes4_images.entry(channel).or_insert_with(|| {
+                                (
+                                    RawBigImage::new(grid_w, grid_h),
+                                    RawBigImage::new(grid_w, grid_h),
+                                    RawBigImage::new(grid_w, grid_h),
+                                    RawBigImage::new(grid_w, grid_h),
+                                )
+                            });
+                            let ok0 = i0.set_tile_at(col, row, &p0, width, height);
+                            let ok1 = i1.set_tile_at(col, row, &p1, width, height);
+                            let ok2 = i2.set_tile_at(col, row, &p2, width, height);
+                            let ok3 = i3.set_tile_at(col, row, &p3, width, height);
+                            if ok0 && ok1 && ok2 && ok3 {
+                                *loaded_per_channel.entry(channel).or_insert(0) += 1;
+                            }
+                        }
                         None => {}
                     }
                 }
@@ -375,24 +394,35 @@ fn main() {
         std::process::exit(1);
     }
 
-    println!("\nNormalizing (against each channel's global min/max) and saving...");
-
     let mut scalar_channels: Vec<usize> = scalar_images.keys().cloned().collect();
     scalar_channels.sort_unstable();
 
     for channel in &scalar_channels {
         let raw = &scalar_images[channel];
-        let range = fixed_channel_range(*channel).or_else(|| raw.value_range());
-        let Some((min, max)) = range else {
+        if raw.coverage_fraction() == 0.0 {
             eprintln!("Channel {} has no data at all, skipping.", channel);
             continue;
+        }
+
+        let big_image = match fixed_channel_range(*channel) {
+            Some((min, max)) => {
+                raw.finalize_grayscale(min, max)
+            }
+            None if *channel == 1 => {
+                match raw.value_range() {
+                    Some((min, max)) => {
+                        raw.finalize_grayscale(min, max)
+                    }
+                    None => {
+                        raw.finalize_raw()
+                    }
+                }
+            }
+            None => {
+                raw.finalize_raw()
+            }
         };
-        let coverage_pct = raw.coverage_fraction() * 100.0;
-        println!(
-            "  channel {}: using range [{:.3}, {:.3}], {:.1}% of world has this channel present",
-            channel, min, max, coverage_pct
-        );
-        let big_image = raw.finalize_grayscale(min, max);
+
         let out_path = output_dir.join(format!("{}.png", channel_label(*channel)));
         match big_image.save(&out_path) {
             Ok(()) => println!(
@@ -416,14 +446,14 @@ fn main() {
         let bz = iz.finalize_grayscale(min, max);
         let label = channel_label(*channel);
 
-        for (component, img) in [("x", &bx), ("y", &by), ("z", &bz)] {
-            let out_path = output_dir.join(format!("{}_{}.png", label, component));
-            if let Err(e) = img.save(&out_path) {
-                eprintln!("Error saving '{}': {}", out_path.display(), e);
-            } else {
-                println!("Saved channel {} component {} -> {}", channel, component, out_path.display());
-            }
-        }
+        // for (component, img) in [("x", &bx), ("y", &by), ("z", &bz)] {
+        //     let out_path = output_dir.join(format!("{}_{}.png", label, component));
+        //     if let Err(e) = img.save(&out_path) {
+        //         eprintln!("Error saving '{}': {}", out_path.display(), e);
+        //     } else {
+        //         println!("Saved channel {} component {} -> {}", channel, component, out_path.display());
+        //     }
+        // }
 
         let rgb_path = output_dir.join(format!("{}_rgb.png", label));
         match save_rgb_from_channels(&bx, &by, &bz, &rgb_path) {
@@ -437,7 +467,55 @@ fn main() {
         }
     }
 
-    if !cm_matches.is_empty() {
+    let mut planes4_channels: Vec<usize> = planes4_images.keys().cloned().collect();
+    planes4_channels.sort_unstable();
+
+    for channel in &planes4_channels {
+        let (i0, i1, i2, i3) = &planes4_images[channel];
+        let label = channel_label(*channel);
+
+        let mut finalized: HashMap<&str, landfile::BigImage> = HashMap::new();
+        for (component, img) in [("layer0", i0), ("layer1", i1), ("layer2", i2), ("layer3", i3)] {
+            if img.coverage_fraction() == 0.0 {
+                continue;
+            }
+            let big_image = img.finalize_grayscale(0.0, 255.0);
+            // let out_path = output_dir.join(format!("{}_{}.png", label, component));
+            // if let Err(e) = big_image.save(&out_path) {
+            //     eprintln!("Error saving '{}': {}", out_path.display(), e);
+            // } else {
+            //     println!("Saved channel {} {} -> {}", channel, component, out_path.display());
+            // }
+            finalized.insert(component, big_image);
+        }
+
+        // if *channel == 1 {
+            match (
+                finalized.get("layer0"),
+                finalized.get("layer1"),
+                finalized.get("layer2"),
+                finalized.get("layer3"),
+            ) {
+                (Some(r), Some(g), Some(b), Some(a)) => {
+                    let rgba_path = output_dir.join(format!("{}_rgba.png", label));
+                    match save_rgba_from_channels(r, g, b, a, &rgba_path) {
+                        Ok(()) => println!(
+                            "Saved channel {} as combined RGBA -> {}",
+                            channel,
+                            rgba_path.display()
+                        ),
+                        Err(e) => eprintln!("Error saving '{}': {}", rgba_path.display(), e),
+                    }
+                }
+                _ => eprintln!(
+                    "\tWarning: channel {} is missing one or more RGBA planes, skipping combined image",
+                    channel
+                ),
+            }
+        // }
+    }
+
+    if !cm_matches.is_empty() && args.channels.is_none() {
         let cm_min_x = cm_matches.iter().map(|c| c.x).min().unwrap();
         let cm_max_x = cm_matches.iter().map(|c| c.x).max().unwrap();
         let cm_min_z = cm_matches.iter().map(|c| c.z).min().unwrap();
@@ -499,7 +577,7 @@ fn main() {
         println!("\nNo colour map tiles found for this world.");
     }
 
-    let total_channels = scalar_channels.len() + vec3_channels.len();
+    let total_channels = scalar_channels.len() + vec3_channels.len() + planes4_channels.len();
     if total_channels == 0 {
         eprintln!("No channels produced any tiles; nothing to save.");
     }

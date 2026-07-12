@@ -300,6 +300,33 @@ impl LandFile {
                     height: height as u32,
                 })
             }
+            1 | 2 | 3 | 4 | 5 | 8 => {
+                let n = words_per_row * height;
+                let mut p0 = vec![0.0f32; n];
+                let mut p1 = vec![0.0f32; n];
+                let mut p2 = vec![0.0f32; n];
+                let mut p3 = vec![0.0f32; n];
+
+                for row in 0..height {
+                    for col in 0..words_per_row {
+                        let idx = row * words_per_row + col;
+                        let word = section.data[idx];
+                        p0[idx] = (word & 0xFF) as f32;
+                        p1[idx] = ((word >> 8) & 0xFF) as f32;
+                        p2[idx] = ((word >> 16) & 0xFF) as f32;
+                        p3[idx] = ((word >> 24) & 0xFF) as f32;
+                    }
+                }
+
+                Some(RawTile::Planes4 {
+                    p0,
+                    p1,
+                    p2,
+                    p3,
+                    width: words_per_row as u32,
+                    height: height as u32,
+                })
+            }
             _ => {
                 let values: Vec<f32> = section.data[..words_per_row * height]
                     .iter()
@@ -325,6 +352,14 @@ pub enum RawTile {
         x: Vec<f32>,
         y: Vec<f32>,
         z: Vec<f32>,
+        width: u32,
+        height: u32,
+    },
+    Planes4 {
+        p0: Vec<f32>,
+        p1: Vec<f32>,
+        p2: Vec<f32>,
+        p3: Vec<f32>,
         width: u32,
         height: u32,
     },
@@ -428,6 +463,45 @@ pub fn save_rgb_from_channels(r: &BigImage, g: &BigImage, b: &BigImage, path: &P
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
 }
 
+pub fn save_rgba_from_channels(
+    r: &BigImage,
+    g: &BigImage,
+    b: &BigImage,
+    a: &BigImage,
+    path: &Path,
+) -> io::Result<()> {
+    if !(r.initialized && g.initialized && b.initialized && a.initialized) {
+        eprintln!("\tWarning: not all colour components were populated, skipping RGBA save");
+        return Ok(());
+    }
+    if r.dim_x != g.dim_x || r.dim_x != b.dim_x || r.dim_x != a.dim_x
+        || r.dim_y != g.dim_y || r.dim_y != b.dim_y || r.dim_y != a.dim_y
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "colour component dimensions don't match",
+        ));
+    }
+
+    let mut buf = vec![0u8; (r.dim_x as usize) * (r.dim_y as usize) * 4];
+    for y in 0..r.dim_y {
+        let src_y = r.dim_y - 1 - y;
+        for x in 0..r.dim_x {
+            let src_idx = (src_y * r.dim_x + x) as usize;
+            let dst_idx = ((y * r.dim_x + x) as usize) * 4;
+            buf[dst_idx] = (r.pixels[src_idx] >> 8) as u8;
+            buf[dst_idx + 1] = (g.pixels[src_idx] >> 8) as u8;
+            buf[dst_idx + 2] = (b.pixels[src_idx] >> 8) as u8;
+            buf[dst_idx + 3] = (a.pixels[src_idx] >> 8) as u8;
+        }
+    }
+
+    let img = ImageBuffer::<image::Rgba<u8>, _>::from_vec(r.dim_x, r.dim_y, buf)
+        .expect("rgba buffer size always matches dim_x*dim_y*4");
+    img.save(path)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+}
+
 pub struct RawBigImage {
     pixels: Vec<f32>,
     written: Vec<bool>,
@@ -509,9 +583,7 @@ impl RawBigImage {
             let dst_y = base_y + r;
             let dst_start = (dst_y * self.dim_x + base_x) as usize;
             self.pixels[dst_start..dst_start + self.tile_w as usize].copy_from_slice(src_row);
-            for i in 0..self.tile_w as usize {
-                self.written[dst_start + i] = true;
-            }
+            self.written[dst_start..dst_start + self.tile_w as usize].fill(true);
         }
 
         true
@@ -544,6 +616,24 @@ impl RawBigImage {
         } else {
             None
         }
+    }
+
+    pub fn finalize_raw(&self) -> BigImage {
+        let pixels: Vec<u16> = self
+            .pixels
+            .iter()
+            .zip(self.written.iter())
+            .map(|(&v, &was_written)| {
+                if !was_written {
+                    0
+                } else {
+                    v.round().clamp(0.0, 65535.0) as u16
+                }
+            })
+            .collect();
+        BigImage::from_pixels(
+            pixels, self.dim_x, self.dim_y, self.tile_w, self.tile_h, self.grid_w, self.grid_h,
+        )
     }
 
     pub fn finalize_grayscale(&self, min: f32, max: f32) -> BigImage {
