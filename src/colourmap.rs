@@ -60,4 +60,23 @@ impl ColourMapGrid {
             }
         }
     }
+
+    pub fn save_cropped(&self, path: &Path, target_w: u32, target_h: u32) -> io::Result<()> {
+        match &self.img {
+            Some(img) => {
+                let w = target_w.min(img.width());
+                let h = target_h.min(img.height());
+                if w == img.width() && h == img.height() {
+                    img.save(path)
+                } else {
+                    img.crop_imm(0, 0, w, h).save(path)
+                }
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
+            }
+            None => {
+                eprintln!("\tWarning: no colour map tiles were collected, skipping save");
+                Ok(())
+            }
+        }
+    }
 }

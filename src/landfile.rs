@@ -406,6 +406,10 @@ impl BigImage {
         }
     }
 
+    pub fn dimensions(&self) -> (u32, u32) {
+        (self.dim_x, self.dim_y)
+    }
+
     pub fn save(&self, path: &Path) -> io::Result<()> {
         if !self.initialized {
             eprintln!("\tWarning: no tiles were added to the combined image, skipping save");

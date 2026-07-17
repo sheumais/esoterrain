@@ -469,6 +469,7 @@ fn main() {
 
     let mut planes4_channels: Vec<usize> = planes4_images.keys().cloned().collect();
     planes4_channels.sort_unstable();
+    let mut channel1_dims: Option<(u32, u32)> = None;
 
     for channel in &planes4_channels {
         let (i0, i1, i2, i3) = &planes4_images[channel];
@@ -480,11 +481,13 @@ fn main() {
                 continue;
             }
             let big_image = img.finalize_grayscale(0.0, 255.0);
-            // let out_path = output_dir.join(format!("{}_{}.png", label, component));
-            // if let Err(e) = big_image.save(&out_path) {
-            //     eprintln!("Error saving '{}': {}", out_path.display(), e);
-            // } else {
-            //     println!("Saved channel {} {} -> {}", channel, component, out_path.display());
+            // if *channel == 1 {
+            //     let out_path = output_dir.join(format!("{}_{}.png", label, component));
+            //     if let Err(e) = big_image.save(&out_path) {
+            //         eprintln!("Error saving '{}': {}", out_path.display(), e);
+            //     } else {
+            //         println!("Saved channel {} {} -> {}", channel, component, out_path.display());
+            //     }
             // }
             finalized.insert(component, big_image);
         }
@@ -498,13 +501,24 @@ fn main() {
             ) {
                 (Some(r), Some(g), Some(b), Some(a)) => {
                     let rgba_path = output_dir.join(format!("{}_rgba.png", label));
-                    match save_rgba_from_channels(r, g, b, a, &rgba_path) {
-                        Ok(()) => println!(
-                            "Saved channel {} as combined RGBA -> {}",
-                            channel,
-                            rgba_path.display()
-                        ),
-                        Err(e) => eprintln!("Error saving '{}': {}", rgba_path.display(), e),
+                    if *channel == 1 {
+                        channel1_dims = Some(r.dimensions());
+                        match save_rgba_from_channels(b, g, r, a, &rgba_path) { // flip the blue and red channels
+                            Ok(()) => println!(
+                                "Saved channel 1 as combined RGBA -> {}",
+                                rgba_path.display()
+                            ),
+                            Err(e) => eprintln!("Error saving '{}': {}", rgba_path.display(), e),
+                        }
+                    } else {
+                        match save_rgba_from_channels(r, g, b, a, &rgba_path) {
+                            Ok(()) => println!(
+                                "Saved channel {} as combined RGBA -> {}",
+                                channel,
+                                rgba_path.display()
+                            ),
+                            Err(e) => eprintln!("Error saving '{}': {}", rgba_path.display(), e),
+                        }
                     }
                 }
                 _ => eprintln!(
@@ -563,12 +577,23 @@ fn main() {
 
         let normal_path = output_dir.join("colourmap.png");
         let overlay_path = output_dir.join("colourmap_overlay.png");
-        if let Err(e) = normal_grid.save(&normal_path) {
+
+        let save_result = |grid: &ColourMapGrid, path: &Path| -> std::io::Result<()> {
+            match channel1_dims {
+                Some((w, h)) => grid.save_cropped(path, w, h),
+                None => {
+                    eprintln!("\tWarning: channel 1 dimensions unavailable, saving colour map uncropped");
+                    grid.save(path)
+                }
+            }
+        };
+
+        if let Err(e) = save_result(&normal_grid, &normal_path) {
             eprintln!("Error saving '{}': {}", normal_path.display(), e);
         } else {
             println!("Saved colour map -> {}", normal_path.display());
         }
-        if let Err(e) = overlay_grid.save(&overlay_path) {
+        if let Err(e) = save_result(&overlay_grid, &overlay_path) {
             eprintln!("Error saving '{}': {}", overlay_path.display(), e);
         } else {
             println!("Saved colour map overlay -> {}", overlay_path.display());
