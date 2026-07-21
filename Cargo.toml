@@ -6,3 +6,4 @@ edition = "2021"
 [dependencies]
 image = { version = "0.24", default-features = false, features = ["png", "dds"] }
 walkdir = "2"
+serde_json = "1"

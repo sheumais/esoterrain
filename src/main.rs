@@ -3,6 +3,7 @@ mod landfile;
 mod manifest;
 mod reader;
 mod colourmap;
+mod placement;
 
 use landfile::{fixed_channel_range, save_rgb_from_channels, LandFile, RawBigImage, RawTile};
 use manifest::filter_manifest;
@@ -32,6 +33,7 @@ struct Args {
     skip_export: bool,
     no_cleanup: bool,
     channels: Option<Vec<usize>>,
+    placement_only: bool,
 }
 
 fn parse_int_arg(s: &str) -> u32 {
@@ -72,7 +74,7 @@ fn channel_label(index: usize) -> String {
 
 fn print_usage() {
     eprintln!(
-        "Usage: land_export <world> [options]\n\n\
+        "Usage: land_export (or cargo run) <world> [options]\n\n\
 Required:\n  \
 <world>              World ID, hex (0xe9) or decimal\n\n\
 Options:\n  \
@@ -83,7 +85,8 @@ Options:\n  \
 --channels <list>    Comma-separated channel indices to export (default: all found)\n  \
 --dry-run            Show what would happen without exporting/deleting\n  \
 --skip-export        Skip calling the exporter; assume files are already on disk\n  \
---no-cleanup         Keep every file the archive export dumped",
+--no-cleanup         Keep every file the archive export dumped\n  \
+--placement-only    Only export/parse the placement (instance) file for this world; skip terrain/colourmap entirely",
         MNF_EXPORT, RAW_MNF, DEFAULT_EXE, DEFAULT_OUT
     );
 }
@@ -99,6 +102,7 @@ fn parse_args() -> Args {
     let mut skip_export = false;
     let mut no_cleanup = false;
     let mut channels: Option<Vec<usize>> = None;
+    let mut placement_only = false;
 
     let mut i = 0;
     while i < raw.len() {
@@ -127,6 +131,7 @@ fn parse_args() -> Args {
             "--dry-run" => dry_run = true,
             "--skip-export" => skip_export = true,
             "--no-cleanup" => no_cleanup = true,
+            "--placement-only" => placement_only = true,
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -159,12 +164,109 @@ fn parse_args() -> Args {
         skip_export,
         no_cleanup,
         channels,
+        placement_only,
     }
 }
 
 
 fn main() {
     let args = parse_args();
+
+    if args.placement_only {
+        println!("Placement-only mode: looking up instance list for world 0x{:x}...", args.world);
+        let pm = match manifest::filter_placement_manifest(&args.manifest, args.world) {
+            Ok(Some(pm)) => pm,
+            Ok(None) => {
+                eprintln!("No placement/instance list found for this world.");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Failed to read manifest '{}': {}", args.manifest, e);
+                std::process::exit(1);
+            }
+        };
+        println!("Placement/instance list: index {} (arch {})", pm.index, pm.arch);
+
+        if !args.skip_export {
+            println!("\nExporting archive {}...", pm.arch);
+            if !export::export_archive(&args.exe, &args.mnf, &args.out, pm.arch, args.dry_run) {
+                eprintln!("Archive export reported an error; check output above before continuing.");
+            }
+
+            if !args.no_cleanup {
+                let mut wanted = HashSet::new();
+                wanted.insert(pm.index);
+                println!("\nCleaning up export directory (keeping 1 relevant file)...");
+                let (kept, removed) = export::cleanup_export_dir(&args.out, &wanted, args.dry_run);
+                println!("Kept {} files, removed {} files.", kept, removed);
+            } else {
+                println!("\nSkipping cleanup (--no-cleanup).");
+            }
+        } else {
+            println!("\nSkipping export step (--skip-export).");
+        }
+
+        if args.dry_run {
+            println!("\nDry run complete; no file was parsed.");
+            return;
+        }
+
+        let mut found_path: Option<std::path::PathBuf> = None;
+        for entry in WalkDir::new(&args.out).into_iter().filter_map(Result::ok) {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s == pm.index.to_string())
+                .unwrap_or(false)
+            {
+                found_path = Some(path.to_path_buf());
+                break;
+            }
+        }
+
+        let output_dir = Path::new(FINAL_EXPORT_DIR).join(format!("world_0x{:x}_placement", args.world));
+        if let Err(e) = std::fs::create_dir_all(&output_dir) {
+            eprintln!("Failed to create output directory '{}': {}", output_dir.display(), e);
+            std::process::exit(1);
+        }
+
+        match found_path {
+            Some(path) => {
+                let out_path = output_dir.join("placement.json");
+                match placement::parse_and_write(&path, &out_path) {
+                    Ok(()) => println!("Parsed placement/instance list -> {}", out_path.display()),
+                    Err(e) => {
+                        eprintln!("Error parsing placement file '{}': {}", path.display(), e);
+                        std::process::exit(1);
+                    }
+                }
+            }
+            None => {
+                eprintln!(
+                    "Placement file (index {}) not found on disk under '{}'; was --skip-export used without it present?",
+                    pm.index, args.out
+                );
+                std::process::exit(1);
+            }
+        }
+
+        if !args.no_cleanup {
+            match std::fs::remove_dir_all(&args.out) {
+                Ok(()) => println!("Removed temporary export directory '{}'.", args.out),
+                Err(e) => eprintln!(
+                    "Warning: failed to remove temporary directory '{}': {}",
+                    args.out, e
+                ),
+            }
+        }
+
+        println!("\nFinished (placement-only).");
+        return;
+    }
 
     println!("Filtering manifest for world 0x{:x}...", args.world);
     let result = match filter_manifest(&args.manifest, args.world) {
@@ -236,14 +338,30 @@ fn main() {
         wanted_indices.insert(m.index);
     }
 
+    let placement_match = match manifest::filter_placement_manifest(&args.manifest, args.world) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!("Failed to read placement match: {}", e);
+            None
+        }
+    };
+    if let Some(pm) = &placement_match {
+        println!("Placement/instance list: index {} (arch {})", pm.index, pm.arch);
+        wanted_indices.insert(pm.index);
+    }
+
     let cell_archs: HashSet<u32> = result.cell_matches.iter().map(|c| c.arch).collect();
     let toc_archs: HashSet<u32> = result.toc_matches.iter().map(|t| t.arch).collect();
     let cm_archs: HashSet<u32> = cm_matches.iter().map(|c| c.arch).collect();
+    let placement_archs: HashSet<u32> = placement_match.iter().map(|p| p.arch).collect();
     let mut all_archs: Vec<u32> = cell_archs
         .union(&toc_archs)
         .cloned()
         .collect::<HashSet<u32>>()
         .union(&cm_archs)
+        .cloned()
+        .collect::<HashSet<u32>>()
+        .union(&placement_archs)
         .cloned()
         .collect();
     all_archs.sort_unstable();
@@ -259,10 +377,7 @@ fn main() {
         }
 
         if !args.no_cleanup {
-            println!(
-                "\nCleaning up export directory (keeping {} relevant files)...",
-                wanted_indices.len()
-            );
+            println!("\nCleaning up export directory...");
             let (kept, removed) = export::cleanup_export_dir(&args.out, &wanted_indices, args.dry_run);
             println!("Kept {} files, removed {} files.", kept, removed);
         } else {
@@ -600,6 +715,39 @@ fn main() {
         }
     } else {
         println!("\nNo colour map tiles found for this world.");
+    }
+
+    if let Some(pm) = &placement_match {
+        let mut found_path: Option<std::path::PathBuf> = None;
+        for entry in WalkDir::new(&args.out).into_iter().filter_map(Result::ok) {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            if path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s == pm.index.to_string())
+                .unwrap_or(false)
+            {
+                found_path = Some(path.to_path_buf());
+                break;
+            }
+        }
+
+        match found_path {
+            Some(path) => {
+                let out_path = output_dir.join("placement.json");
+                match placement::parse_and_write(&path, &out_path) {
+                    Ok(()) => println!("Parsed placement/instance list -> {}", out_path.display()),
+                    Err(e) => eprintln!("Error parsing placement file '{}': {}", path.display(), e),
+                }
+            }
+            None => eprintln!(
+                "Warning: placement file (index {}) not found on disk; was --skip-export used without it present?",
+                pm.index
+            ),
+        }
     }
 
     let total_channels = scalar_channels.len() + vec3_channels.len() + planes4_channels.len();

@@ -2,6 +2,8 @@ use std::io;
 
 pub const WORLD_MASK: u32 = 0x7FF;
 pub const TYPE_MASK: u32 = 0x1F;
+pub const PLACEMENT_CATEGORY: u32 = 0x4800_0000;
+pub const PLACEMENT_TYPE: u32 = 0x02;
 
 #[derive(Debug, Clone, Copy)]
 pub struct TocMatch {
@@ -20,6 +22,17 @@ pub struct CellMatch {
 pub struct ManifestResult {
     pub toc_matches: Vec<TocMatch>,
     pub cell_matches: Vec<CellMatch>,
+}
+
+
+#[derive(Debug, Clone, Copy)]
+pub struct PlacementMatch {
+    pub index: u32,
+    pub arch: u32,
+}
+
+fn placement_high(world: u32) -> u32 {
+    PLACEMENT_CATEGORY | ((world & WORLD_MASK) << 5) | (PLACEMENT_TYPE & TYPE_MASK)
 }
 
 fn toc_file_id(world: u32) -> u64 {
@@ -155,4 +168,30 @@ pub fn filter_colourmap_manifest(manifest_path: &str, world: u32) -> io::Result<
         });
     }
     Ok(matches)
+}
+
+pub fn filter_placement_manifest(manifest_path: &str, world: u32) -> io::Result<Option<PlacementMatch>> {
+    let target = placement_high(world);
+    let content = std::fs::read_to_string(manifest_path)?;
+
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let row: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
+        if row.len() < 11 {
+            continue;
+        }
+        let (index, file_index, unk1, arch) = match (
+            parse_int(row[0]), parse_int(row[2]), parse_int(row[3]), parse_int(row[9]),
+        ) {
+            (Some(i), Some(fi), Some(u), Some(a)) => (i as u32, fi as u32, u as u32, a as u32),
+            _ => continue,
+        };
+
+        if unk1 == target && file_index == 0 {
+            return Ok(Some(PlacementMatch { index, arch }));
+        }
+    }
+    Ok(None)
 }
