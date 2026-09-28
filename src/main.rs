@@ -4,6 +4,7 @@ mod manifest;
 mod reader;
 mod colourmap;
 mod placement;
+mod worldlut;
 
 use landfile::{fixed_channel_range, save_rgb_from_channels, LandFile, RawBigImage, RawTile};
 use manifest::filter_manifest;
@@ -34,6 +35,8 @@ struct Args {
     no_cleanup: bool,
     channels: Option<Vec<usize>>,
     placement_only: bool,
+    list_worlds: bool,
+    world_lut: bool,
 }
 
 fn parse_int_arg(s: &str) -> u32 {
@@ -86,7 +89,9 @@ Options:\n  \
 --dry-run            Show what would happen without exporting/deleting\n  \
 --skip-export        Skip calling the exporter; assume files are already on disk\n  \
 --no-cleanup         Keep every file the archive export dumped\n  \
---placement-only    Only export/parse the placement (instance) file for this world; skip terrain/colourmap entirely",
+--placement-only     Only export/parse the placement (instance) file for this world; skip terrain/colourmap entirely\n  \
+--list-worlds        List every world found in the manifest with terrain cell data, and its grid size (no export/world arg needed)
+--world-lut          Export the world table (0x6000003C) and write export/worlds_lut.csv",
         MNF_EXPORT, RAW_MNF, DEFAULT_EXE, DEFAULT_OUT
     );
 }
@@ -103,6 +108,8 @@ fn parse_args() -> Args {
     let mut no_cleanup = false;
     let mut channels: Option<Vec<usize>> = None;
     let mut placement_only = false;
+    let mut list_worlds = false;
+    let mut world_lut = false;
 
     let mut i = 0;
     while i < raw.len() {
@@ -132,6 +139,9 @@ fn parse_args() -> Args {
             "--skip-export" => skip_export = true,
             "--no-cleanup" => no_cleanup = true,
             "--placement-only" => placement_only = true,
+            "--list-worlds" => list_worlds = true,
+            "--world-lut" => world_lut = true,
+
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -141,18 +151,23 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    let world_str: &String = match positional.len() {
-        1 => &positional[0],
-        2 => {
-            manifest = positional[0].clone();
-            &positional[1]
-        }
-        _ => {
-            print_usage();
-            std::process::exit(1);
-        }
+    let world = if list_worlds || world_lut {
+        // No world id needed for this mode; ignore any stray positional args.
+        0
+    } else {
+        let world_str: &String = match positional.len() {
+            1 => &positional[0],
+            2 => {
+                manifest = positional[0].clone();
+                &positional[1]
+            }
+            _ => {
+                print_usage();
+                std::process::exit(1);
+            }
+        };
+        parse_int_arg(world_str)
     };
-    let world = parse_int_arg(world_str);
 
     Args {
         manifest,
@@ -165,12 +180,74 @@ fn parse_args() -> Args {
         no_cleanup,
         channels,
         placement_only,
+        list_worlds,
+        world_lut,
     }
 }
 
+const ANSI_RED: &str = "\x1b[31m";
+const ANSI_RESET: &str = "\x1b[0m";
 
 fn main() {
     let args = parse_args();
+
+    if args.list_worlds {
+        println!("Scanning manifest '{}' for worlds with terrain cell data...", args.manifest);
+        let summaries = match manifest::list_worlds_with_cells(&args.manifest) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("Failed to read manifest '{}': {}", args.manifest, e);
+                std::process::exit(1);
+            }
+        };
+
+        if summaries.is_empty() {
+            println!("No worlds with terrain cell data found.");
+            return;
+        }
+
+        println!(
+            "{:<12} {:>6} {:>6} {:>10}   {:<14} range",
+            "World", "W", "H", "Cells", "Archive(s)"
+        );
+        for s in &summaries {
+            let archives_str = s
+                .archives
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let line = format!(
+                "0x{:<10x} {:>6} {:>6} {:>10}   {:<14} x {}..{}, z {}..{}",
+                s.world,
+                s.grid_w(),
+                s.grid_h(),
+                s.cell_count,
+                archives_str,
+                s.min_x,
+                s.max_x,
+                s.min_z,
+                s.max_z
+            );
+
+            if s.has_unavailable_archive() {
+                println!("{ANSI_RED}{line}  [NOT AVAILABLE]{ANSI_RESET}");
+            } else {
+                println!("{line}");
+            }
+        }
+
+        let unavailable_count = summaries.iter().filter(|s| s.has_unavailable_archive()).count();
+        println!("\n{} world(s) found.", summaries.len());
+        if unavailable_count > 0 {
+            println!(
+                "{ANSI_RED}{} world(s) reference archive {}+ and are not available in the client files.{ANSI_RESET}",
+                unavailable_count, manifest::UNAVAILABLE_ARCHIVE_THRESHOLD
+            );
+        }
+        return;
+    }
 
     if args.placement_only {
         println!("Placement-only mode: looking up instance list for world 0x{:x}...", args.world);
@@ -265,6 +342,81 @@ fn main() {
         }
 
         println!("\nFinished (placement-only).");
+        return;
+    }
+
+    if args.world_lut {
+        let m = match manifest::filter_world_lut_manifest(&args.manifest) {
+            Ok(Some(m)) => m,
+            Ok(None) => { eprintln!("World LUT entry not found in manifest."); std::process::exit(1); }
+            Err(e) => { eprintln!("Failed to read manifest '{}': {}", args.manifest, e); std::process::exit(1); }
+        };
+        println!("World LUT: index {} (arch {})", m.index, m.arch);
+
+        if !args.skip_export {
+            println!("\nExporting archive {}...", m.arch);
+            if !export::export_archive_combined(&args.exe, &args.mnf, &args.out, m.arch, args.dry_run) {
+                eprintln!("Archive export reported an error; check output above before continuing.");
+            }
+
+            if !args.no_cleanup {
+                let mut wanted = HashSet::new();
+                wanted.insert(m.index);
+                let (kept, removed) = export::cleanup_export_dir_keeping(
+                &args.out, &wanted, &["en.lang.csv"], args.dry_run,
+                );
+                println!("Kept {} files, removed {} files.", kept, removed);
+            }
+        }
+        if args.dry_run { println!("\nDry run complete."); return; }
+
+        let wanted_name = format!("{}_Uncompressed", m.index);
+        let found = WalkDir::new(&args.out)
+            .into_iter()
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.path().is_file()
+                    && e.path()
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map_or(false, |s| s == wanted_name)
+            });
+        let Some(entry) = found else {
+            eprintln!(
+                "Uncompressed World LUT file '{}.*' not found under '{}'.",
+                wanted_name, args.out
+            );
+            std::process::exit(1);
+        };
+        println!("Parsing file: {}", entry.path().display());
+    
+        std::fs::create_dir_all(FINAL_EXPORT_DIR).expect("failed to create export dir");
+        let out_path = Path::new(FINAL_EXPORT_DIR).join("worlds_lut.csv");
+        let lang_path = WalkDir::new(&args.out)
+            .into_iter()
+            .filter_map(Result::ok)
+            .map(|e| e.into_path())
+            .find(|p| p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some("en.lang.csv"));
+
+        let zone_names = match &lang_path {
+            Some(p) => match worldlut::load_zone_names(p) {
+                Ok(n) => { println!("Loaded {} zone names from {}", n.len(), p.display()); n }
+                Err(e) => { eprintln!("Failed to read '{}': {}", p.display(), e); Default::default() }
+            },
+            None => {
+                eprintln!("Warning: en.lang.csv not found under '{}'; zone_name will be empty.", args.out);
+                Default::default()
+            }
+        };
+
+        match worldlut::parse_and_write(entry.path(), &zone_names, &out_path) {
+            Ok(n) => println!("Wrote {} worlds -> {}", n, out_path.display()),
+            Err(e) => { eprintln!("Error parsing '{}': {}", entry.path().display(), e); std::process::exit(1); }
+        }
+
+        if !args.no_cleanup {
+            let _ = std::fs::remove_dir_all(&args.out);
+        }
         return;
     }
 
