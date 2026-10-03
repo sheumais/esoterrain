@@ -295,12 +295,19 @@ pub fn list_worlds_with_cells(manifest_path: &str) -> io::Result<Vec<WorldSummar
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct WorldLutMatch {
+pub struct TableMatch {
     pub index: u32,
     pub arch: u32,
 }
 
-pub fn filter_world_lut_manifest(manifest_path: &str) -> io::Result<Option<WorldLutMatch>> {
+pub const TABLE_HIGH: u32 = 0x6000_0000;
+pub const WORLD_LUT_FILE_INDEX: u32 = 0x3C;
+pub const MODEL_LIST_FILE_INDEX: u32 = 0x145;
+
+pub fn filter_table_manifest(
+    manifest_path: &str,
+    target_file_index: u32,
+) -> io::Result<Option<TableMatch>> {
     let content = std::fs::read_to_string(manifest_path)?;
     for line in content.lines() {
         let row: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
@@ -310,11 +317,13 @@ pub fn filter_world_lut_manifest(manifest_path: &str) -> io::Result<Option<World
         let (index, id1, file_index, unk1, arch) = match (
             parse_int(row[0]), parse_int(row[1]), parse_int(row[2]), parse_int(row[3]), parse_int(row[9]),
         ) {
-            (Some(i), Some(id), Some(fi), Some(u), Some(a)) => (i as u32, id as u32, fi as u32, u as u32, a as u32),
+            (Some(i), Some(id), Some(fi), Some(u), Some(a)) => {
+                (i as u32, id as u32, fi as u32, u as u32, a as u32)
+            }
             _ => continue,
         };
-        if unk1 == 0x6000_0000 && file_index == 0x3C && id1 == 0x0000_0000 {
-            return Ok(Some(WorldLutMatch { index, arch }));
+        if unk1 == TABLE_HIGH && file_index == target_file_index && id1 == 0 {
+            return Ok(Some(TableMatch { index, arch }));
         }
     }
     Ok(None)

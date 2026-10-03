@@ -5,6 +5,8 @@ mod reader;
 mod colourmap;
 mod placement;
 mod worldlut;
+mod model;
+mod creature;
 
 use landfile::{fixed_channel_range, save_rgb_from_channels, LandFile, RawBigImage, RawTile};
 use manifest::filter_manifest;
@@ -37,6 +39,8 @@ struct Args {
     placement_only: bool,
     list_worlds: bool,
     world_lut: bool,
+    model_list: bool,
+    creature_list: bool,
 }
 
 fn parse_int_arg(s: &str) -> u32 {
@@ -90,8 +94,12 @@ Options:\n  \
 --skip-export        Skip calling the exporter; assume files are already on disk\n  \
 --no-cleanup         Keep every file the archive export dumped\n  \
 --placement-only     Only export/parse the placement (instance) file for this world; skip terrain/colourmap entirely\n  \
---list-worlds        List every world found in the manifest with terrain cell data, and its grid size (no export/world arg needed)
---world-lut          Export the world table (0x6000003C) and write export/worlds_lut.csv",
+--list-worlds        List every world found in the manifest with terrain cell data, and its grid size (no export/world arg needed)\n \
+--world-lut          Export the world table and write export/worlds_lut.csv\n \
+--models-lut         Export the models table and write export/models_lut.csv\n \
+--creatures-lut      Export the creatures table, creature models and creature textures table and write export/creatures_lut.csv\n \
+--
+",
         MNF_EXPORT, RAW_MNF, DEFAULT_EXE, DEFAULT_OUT
     );
 }
@@ -110,6 +118,8 @@ fn parse_args() -> Args {
     let mut placement_only = false;
     let mut list_worlds = false;
     let mut world_lut = false;
+    let mut model_list = false;
+    let mut creature_list = false;
 
     let mut i = 0;
     while i < raw.len() {
@@ -141,6 +151,8 @@ fn parse_args() -> Args {
             "--placement-only" => placement_only = true,
             "--list-worlds" => list_worlds = true,
             "--world-lut" => world_lut = true,
+            "--model-lut" => model_list = true,
+            "--creature-lut" => creature_list = true,
 
             "-h" | "--help" => {
                 print_usage();
@@ -151,7 +163,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    let world = if list_worlds || world_lut {
+    let world = if list_worlds || world_lut || model_list || creature_list {
         // No world id needed for this mode; ignore any stray positional args.
         0
     } else {
@@ -182,6 +194,8 @@ fn parse_args() -> Args {
         placement_only,
         list_worlds,
         world_lut,
+        model_list,
+        creature_list,
     }
 }
 
@@ -206,6 +220,13 @@ fn main() {
             return;
         }
 
+        let lut = match worldlut::load_lut_csv(Path::new("/export/worlds_lut.csv")) {
+            Ok(m) => m,
+            Err(_) => {
+                HashMap::new()
+            }
+        };
+
         println!(
             "{:<12} {:>6} {:>6} {:>10}   {:<14} range",
             "World", "W", "H", "Cells", "Archive(s)"
@@ -218,17 +239,22 @@ fn main() {
                 .collect::<Vec<_>>()
                 .join(",");
 
+            let range = format!("x {}..{}, z {}..{}", s.min_x, s.max_x, s.min_z, s.max_z);
+            let (internal, name) = match lut.get(&s.world) {
+                Some(i) => (i.world_name.as_str(), i.zone_name.as_str()),
+                None => ("", ""),
+            };
+
             let line = format!(
-                "0x{:<10x} {:>6} {:>6} {:>10}   {:<14} x {}..{}, z {}..{}",
+                "0x{:<10x} {:>6} {:>6} {:>10}   {:<10} {:<34} {:<28} {}",
                 s.world,
                 s.grid_w(),
                 s.grid_h(),
                 s.cell_count,
                 archives_str,
-                s.min_x,
-                s.max_x,
-                s.min_z,
-                s.max_z
+                range,
+                internal,
+                name
             );
 
             if s.has_unavailable_archive() {
@@ -346,7 +372,7 @@ fn main() {
     }
 
     if args.world_lut {
-        let m = match manifest::filter_world_lut_manifest(&args.manifest) {
+        let m = match manifest::filter_table_manifest(&args.manifest, manifest::WORLD_LUT_FILE_INDEX) {
             Ok(Some(m)) => m,
             Ok(None) => { eprintln!("World LUT entry not found in manifest."); std::process::exit(1); }
             Err(e) => { eprintln!("Failed to read manifest '{}': {}", args.manifest, e); std::process::exit(1); }
@@ -420,6 +446,115 @@ fn main() {
         return;
     }
 
+    if args.model_list {
+        let m = match manifest::filter_table_manifest(&args.manifest, manifest::MODEL_LIST_FILE_INDEX) {
+            Ok(Some(m)) => m,
+            Ok(None) => { eprintln!("Model list (file_index 0x145) not found in manifest."); std::process::exit(1); }
+            Err(e) => { eprintln!("Failed to read manifest '{}': {}", args.manifest, e); std::process::exit(1); }
+        };
+        println!("Model list: index {} (arch {})", m.index, m.arch);
+
+        if !args.skip_export {
+            if !export::export_archive_combined(&args.exe, &args.mnf, &args.out, m.arch, args.dry_run) {
+                eprintln!("Archive export reported an error; check output above before continuing.");
+            }
+            if !args.no_cleanup {
+                let mut wanted = HashSet::new();
+                wanted.insert(m.index);
+                let (kept, removed) = export::cleanup_export_dir_keeping(
+                    &args.out, &wanted, &["en.lang.csv"], args.dry_run,
+                );
+                println!("Kept {} files, removed {} files.", kept, removed);
+            }
+        }
+        if args.dry_run { println!("\nDry run complete."); return; }
+
+        let wanted_name = format!("{}_Uncompressed", m.index);
+        let found = WalkDir::new(&args.out).into_iter().filter_map(Result::ok).find(|e| {
+            e.path().is_file()
+                && e.path().file_stem().and_then(|s| s.to_str()).map_or(false, |s| s == wanted_name)
+        });
+        let Some(entry) = found else {
+            eprintln!("Model list file for index {} not found under '{}'.", wanted_name, args.out);
+            std::process::exit(1);
+        };
+
+        let names = WalkDir::new(&args.out).into_iter().filter_map(Result::ok)
+            .map(|e| e.into_path())
+            .find(|p| p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some("en.lang.csv"))
+            .and_then(|p| worldlut::load_lang_group(&p, model::MODEL_NAME_GROUP).ok())
+            .unwrap_or_default();
+
+        std::fs::create_dir_all(FINAL_EXPORT_DIR).expect("failed to create export dir");
+        let out_path = Path::new(FINAL_EXPORT_DIR).join("models_lut.csv");
+        match model::parse_and_write(entry.path(), &names, &out_path) {
+            Ok(n) => println!("Wrote {} models -> {}", n, out_path.display()),
+            Err(e) => { eprintln!("Error parsing '{}': {}", entry.path().display(), e); std::process::exit(1); }
+        }
+        if !args.no_cleanup { let _ = std::fs::remove_dir_all(&args.out); }
+        return;
+    }
+
+    fn find_uncompressed(dir: &str, index: u32) -> Option<std::path::PathBuf> {
+        let want = format!("{}_Uncompressed", index);
+        WalkDir::new(dir).into_iter().filter_map(Result::ok).map(|e| e.into_path())
+            .find(|p| p.is_file() && p.file_stem().and_then(|s| s.to_str()) == Some(want.as_str()))
+    }
+
+    if args.creature_list {
+        let mut found = Vec::new();
+        for (fi, label) in [(0x05u32, "textures"), (0x06, "links"), (0x07, "models"), (0x08, "creatures")] {
+            match manifest::filter_table_manifest(&args.manifest, fi) {
+                Ok(Some(m)) => { println!("{}: index {} (arch {})", label, m.index, m.arch); found.push(m); }
+                Ok(None) => { eprintln!("{} (file_index 0x{:x}) not found in manifest.", label, fi); std::process::exit(1); }
+                Err(e) => { eprintln!("Failed to read manifest '{}': {}", args.manifest, e); std::process::exit(1); }
+            }
+        }
+        let mut archs: Vec<u32> = found.iter().map(|m| m.arch).collect();
+        archs.sort_unstable(); archs.dedup();
+
+        if !args.skip_export {
+            for a in &archs {
+                println!("\nExporting archive {}...", a);
+                if !export::export_archive_combined(&args.exe, &args.mnf, &args.out, *a, args.dry_run) {
+                    eprintln!("Archive export reported an error; check output above before continuing.");
+                }
+            }
+            if !args.no_cleanup {
+                let wanted: HashSet<u32> = found.iter().map(|m| m.index).collect();
+                let (kept, removed) = export::cleanup_export_dir_keeping(&args.out, &wanted, &["en.lang.csv"], args.dry_run);
+                println!("Kept {} files, removed {} files.", kept, removed);
+            }
+        }
+        if args.dry_run { println!("\nDry run complete."); return; }
+
+        let load = |m: &manifest::TableMatch, label: &str| -> creature::Table {
+            let Some(p) = find_uncompressed(&args.out, m.index) else {
+                eprintln!("{} file '{}_Uncompressed' not found under '{}'.", label, m.index, args.out);
+                std::process::exit(1);
+            };
+            creature::Table::load(&p).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); })
+        };
+        let (textures, links, models, creature_tbl) = (
+            load(&found[0], "Texture"), load(&found[1], "Link"),
+            load(&found[2], "Model"), load(&found[3], "Creature"),
+        );
+
+        let names = WalkDir::new(&args.out).into_iter().filter_map(Result::ok).map(|e| e.into_path())
+            .find(|p| p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some("en.lang.csv"))
+            .and_then(|p| worldlut::load_lang_group(&p, creature::CREATURE_NAME_GROUP).ok())
+            .unwrap_or_default();
+        println!("Loaded {} creature names.", names.len());
+
+        std::fs::create_dir_all(FINAL_EXPORT_DIR).expect("failed to create export dir");
+        let out_path = Path::new(FINAL_EXPORT_DIR).join("creatures_lut.csv");
+        match creature::build_csv(&textures, &links, &models, &creature_tbl, &names, &out_path) {
+            Ok(n) => println!("Wrote {} creatures -> {}", n, out_path.display()),
+            Err(e) => { eprintln!("Error writing '{}': {}", out_path.display(), e); std::process::exit(1); }
+        }
+        if !args.no_cleanup { let _ = std::fs::remove_dir_all(&args.out); }
+        return;
+    }
     println!("Filtering manifest for world 0x{:x}...", args.world);
     let result = match filter_manifest(&args.manifest, args.world) {
         Ok(r) => r,

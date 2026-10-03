@@ -13,7 +13,9 @@ https://github.com/uesp/uesp-esoapps/blob/master/EsoLand/EsoLand/EsoLand.cpp
 
 Exports the heightmap data, colourmap, model fixture locations, dev overlay and some other data that idk what it is yet
 
+Also has functionality for exporting some file tables, like every furniture model and every non-human creature model.
+
 generate mnf with (as documented in esoextractdata readme)
 ```shell
-EsoExtractData.exe "C:\Program Files (x86)\Steam\steamapps\common\Zenimax Online\The Elder Scrolls Online PTS\depot\eso.mnf" .\export\ -m eso_mnf.csv
+EsoExtractData.exe "C:\Program Files (x86)\Steam\steamapps\common\Zenimax Online\The Elder Scrolls Online\depot\eso.mnf" .\export\ -m eso_mnf.csv
 ```

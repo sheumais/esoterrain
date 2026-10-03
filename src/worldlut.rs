@@ -90,7 +90,7 @@ pub fn parse(data: &[u8]) -> io::Result<(Vec<WorldEntry>, usize)> {
     Ok((entries, skipped))
 }
 
-fn csv_field(s: &str) -> String {
+pub fn csv_field(s: &str) -> String {
     if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
@@ -136,23 +136,25 @@ fn for_each_csv_row(text: &str, mut f: impl FnMut(&[String])) {
     }
 }
 
-/// Reads en.lang.csv and returns zone id -> zone name.
-/// Rows look like: "162658389","0","<zone id>","<string id>","<name>"
-pub fn load_zone_names(lang_csv: &Path) -> io::Result<HashMap<u32, String>> {
+pub fn load_lang_group(lang_csv: &Path, group: &str) -> io::Result<HashMap<u32, String>> {
     let bytes = std::fs::read(lang_csv)?;
     let text = String::from_utf8_lossy(&bytes);
     let text = text.trim_start_matches('\u{feff}');
 
     let mut names = HashMap::new();
     for_each_csv_row(text, |row| {
-        if row.len() < 5 || row[0] != ZONE_NAME_GROUP {
+        if row.len() < 5 || row[0] != group {
             return;
         }
-        if let Ok(zone) = row[2].trim().parse::<u32>() {
-            names.insert(zone, row[4].clone());
+        if let Ok(idx) = row[2].trim().parse::<u32>() {
+            names.insert(idx, row[4].clone());
         }
     });
     Ok(names)
+}
+
+pub fn load_zone_names(lang_csv: &Path) -> io::Result<HashMap<u32, String>> {
+    load_lang_group(lang_csv, ZONE_NAME_GROUP)
 }
 
 pub fn write_csv(
@@ -205,4 +207,46 @@ pub fn parse_and_write(
     }
     write_csv(&entries, zone_names, out_path)?;
     Ok(entries.len())
+}
+
+#[derive(Debug, Clone)]
+pub struct WorldInfo {
+    pub zone_id: u32,
+    pub width: u32,
+    pub height: u32,
+    pub world_name: String,
+    pub zone_name: String,
+}
+
+
+pub fn load_lut_csv(path: &Path) -> io::Result<HashMap<u32, WorldInfo>> {
+    let bytes = std::fs::read(path)?;
+    let text = String::from_utf8_lossy(&bytes);
+    let text = text.trim_start_matches('\u{feff}');
+ 
+    let mut map = HashMap::new();
+    for_each_csv_row(text, |row| {
+        if row.len() < 7 {
+            return;
+        }
+        let (Ok(world), Ok(zone), Ok(w), Ok(h)) = (
+            row[0].trim().parse::<u32>(),
+            row[2].trim().parse::<u32>(),
+            row[4].trim().parse::<u32>(),
+            row[5].trim().parse::<u32>(),
+        ) else {
+            return;
+        };
+        map.insert(
+            world,
+            WorldInfo {
+                zone_id: zone,
+                width: w,
+                height: h,
+                world_name: row[6].clone(),
+                zone_name: row.get(7).cloned().unwrap_or_default(),
+            },
+        );
+    });
+    Ok(map)
 }
