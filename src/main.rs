@@ -7,6 +7,8 @@ mod placement;
 mod worldlut;
 mod model;
 mod creature;
+mod cell_placement;
+mod sizemap;
 
 use landfile::{fixed_channel_range, save_rgb_from_channels, LandFile, RawBigImage, RawTile};
 use manifest::filter_manifest;
@@ -41,6 +43,9 @@ struct Args {
     world_lut: bool,
     model_list: bool,
     creature_list: bool,
+    size_map: bool,
+    size_type: Option<u32>,
+    size_scale: u32,
 }
 
 fn parse_int_arg(s: &str) -> u32 {
@@ -79,6 +84,55 @@ fn channel_label(index: usize) -> String {
     }
 }
 
+fn write_placements(
+    scan_dir: &str,
+    world_pm: Option<&manifest::PlacementMatch>,
+    cell_pms: &[manifest::CellPlacementMatch],
+    output_dir: &Path,
+) -> usize {
+    let mut paths: HashMap<u32, std::path::PathBuf> = HashMap::new();
+    for entry in WalkDir::new(scan_dir).into_iter().filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_file() { continue; }
+        if let Some(idx) = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u32>().ok()) {
+            paths.entry(idx).or_insert_with(|| path.to_path_buf());
+        }
+    }
+    let mut failures = 0usize;
+
+    if let Some(pm) = world_pm {
+        match paths.get(&pm.index) {
+            Some(path) => {
+                let out_path = output_dir.join("placement.json");
+                match placement::parse_and_write(path, &out_path) {
+                    Ok(()) => println!("Parsed placement/instance list -> {}", out_path.display()),
+                    Err(e) => { eprintln!("Error parsing placement file '{}': {}", path.display(), e); failures += 1; }
+                }
+            }
+            None => { eprintln!("Warning: placement file (index {}) not found under '{}'.", pm.index, scan_dir); failures += 1; }
+        }
+    }
+
+    if !cell_pms.is_empty() {
+        let cell_dir = output_dir.join("cell_placement");
+        let mut ok = 0usize;
+        for c in cell_pms {
+            let Some(path) = paths.get(&c.index) else {
+                eprintln!("Warning: cell placement file (index {}, cell {},{}) not found under '{}'.", c.index, c.x, c.z, scan_dir);
+                failures += 1;
+                continue;
+            };
+            let out_path = cell_dir.join(format!("cell_x{}_z{}.json", c.x, c.z));
+            match cell_placement::parse_and_write_cell(path, &out_path) {
+                Ok(()) => ok += 1,
+                Err(e) => { eprintln!("Error parsing cell placement '{}': {}", path.display(), e); failures += 1; }
+            }
+        }
+        println!("Parsed {}/{} cell placement files -> {}", ok, cell_pms.len(), cell_dir.display());
+    }
+    failures
+}
+
 fn print_usage() {
     eprintln!(
         "Usage: land_export (or cargo run) <world> [options]\n\n\
@@ -93,6 +147,9 @@ Options:\n  \
 --dry-run            Show what would happen without exporting/deleting\n  \
 --skip-export        Skip calling the exporter; assume files are already on disk\n  \
 --no-cleanup         Keep every file the archive export dumped\n  \
+--size-map           Write a rough zone-shape image from manifest file sizes (needs <world>; no export)\n  \
+--size-type <n>     File type (low 5 bits of Unk1) to use for --size-map (default: 0x15, cell placement files)\n  \
+--size-scale <n>    Pixels per cell in the --size-map image (default: 16)\n  \
 --placement-only     Only export/parse the placement (instance) file for this world; skip terrain/colourmap entirely\n  \
 --list-worlds        List every world found in the manifest with terrain cell data, and its grid size (no export/world arg needed)\n \
 --world-lut          Export the world table and write export/worlds_lut.csv\n \
@@ -120,6 +177,9 @@ fn parse_args() -> Args {
     let mut world_lut = false;
     let mut model_list = false;
     let mut creature_list = false;
+    let mut size_map = false;
+    let mut size_type: Option<u32> = None;
+    let mut size_scale: u32 = 16;
 
     let mut i = 0;
     while i < raw.len() {
@@ -153,6 +213,18 @@ fn parse_args() -> Args {
             "--world-lut" => world_lut = true,
             "--model-lut" => model_list = true,
             "--creature-lut" => creature_list = true,
+            "--size-map" => size_map = true,
+
+
+            "--size-type" => {
+                i += 1;
+                size_type = Some(parse_int_arg(raw.get(i).expect("--size-type needs a value")));
+            }
+            "--size-scale" => {
+                i += 1;
+                size_scale = parse_int_arg(raw.get(i).expect("--size-scale needs a value"));
+            }
+
 
             "-h" | "--help" => {
                 print_usage();
@@ -196,6 +268,9 @@ fn parse_args() -> Args {
         world_lut,
         model_list,
         creature_list,
+        size_map,
+        size_type,
+        size_scale,
     }
 }
 
@@ -220,7 +295,7 @@ fn main() {
             return;
         }
 
-        let lut = match worldlut::load_lut_csv(Path::new("/export/worlds_lut.csv")) {
+        let lut = match worldlut::load_lut_csv(Path::new("export/worlds_lut.csv")) {
             Ok(m) => m,
             Err(_) => {
                 HashMap::new()
@@ -275,31 +350,58 @@ fn main() {
         return;
     }
 
+    if args.size_map {
+        println!("Building size map for world 0x{:x}...", args.world);
+        match sizemap::run(
+            &args.manifest,
+            args.world,
+            args.size_type,
+            args.size_scale,
+            Path::new(FINAL_EXPORT_DIR),
+        ) {
+            Ok(p) => println!("Saved size map -> {}", p.display()),
+            Err(e) => {
+                eprintln!("{}", e);
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+
     if args.placement_only {
         println!("Placement-only mode: looking up instance list for world 0x{:x}...", args.world);
         let pm = match manifest::filter_placement_manifest(&args.manifest, args.world) {
-            Ok(Some(pm)) => pm,
-            Ok(None) => {
-                eprintln!("No placement/instance list found for this world.");
-                std::process::exit(1);
-            }
-            Err(e) => {
-                eprintln!("Failed to read manifest '{}': {}", args.manifest, e);
-                std::process::exit(1);
-            }
+            Ok(p) => p,
+            Err(e) => { eprintln!("Failed to read manifest '{}': {}", args.manifest, e); std::process::exit(1); }
         };
-        println!("Placement/instance list: index {} (arch {})", pm.index, pm.arch);
+        let cell_pms = match manifest::filter_cell_placement_manifest(&args.manifest, args.world) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("Failed to read manifest '{}': {}", args.manifest, e); std::process::exit(1); }
+        };
+        if pm.is_none() && cell_pms.is_empty() {
+            eprintln!("No placement/instance lists found for this world.");
+            std::process::exit(1);
+        }
+        if let Some(pm) = &pm {
+            println!("Placement/instance list: index {} (arch {})", pm.index, pm.arch);
+        }
+        println!("Cell placement files: {}", cell_pms.len());
+
+        let mut archs: Vec<u32> = pm.iter().map(|p| p.arch).chain(cell_pms.iter().map(|c| c.arch)).collect();
+        archs.sort_unstable();
+        archs.dedup();
+        let wanted: HashSet<u32> = pm.iter().map(|p| p.index).chain(cell_pms.iter().map(|c| c.index)).collect();
 
         if !args.skip_export {
-            println!("\nExporting archive {}...", pm.arch);
-            if !export::export_archive(&args.exe, &args.mnf, &args.out, pm.arch, args.dry_run) {
-                eprintln!("Archive export reported an error; check output above before continuing.");
+            for arch in &archs {
+                println!("\nExporting archive {}...", arch);
+                if !export::export_archive(&args.exe, &args.mnf, &args.out, *arch, args.dry_run) {
+                    eprintln!("Archive export reported an error; check output above before continuing.");
+                }
             }
-
             if !args.no_cleanup {
-                let mut wanted = HashSet::new();
-                wanted.insert(pm.index);
-                println!("\nCleaning up export directory (keeping 1 relevant file)...");
+                println!("\nCleaning up export directory (keeping {} relevant files)...", wanted.len());
                 let (kept, removed) = export::cleanup_export_dir(&args.out, &wanted, args.dry_run);
                 println!("Kept {} files, removed {} files.", kept, removed);
             } else {
@@ -314,56 +416,20 @@ fn main() {
             return;
         }
 
-        let mut found_path: Option<std::path::PathBuf> = None;
-        for entry in WalkDir::new(&args.out).into_iter().filter_map(Result::ok) {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            if path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s == pm.index.to_string())
-                .unwrap_or(false)
-            {
-                found_path = Some(path.to_path_buf());
-                break;
-            }
-        }
-
         let output_dir = Path::new(FINAL_EXPORT_DIR).join(format!("world_0x{:x}_placement", args.world));
         if let Err(e) = std::fs::create_dir_all(&output_dir) {
             eprintln!("Failed to create output directory '{}': {}", output_dir.display(), e);
             std::process::exit(1);
         }
 
-        match found_path {
-            Some(path) => {
-                let out_path = output_dir.join("placement.json");
-                match placement::parse_and_write(&path, &out_path) {
-                    Ok(()) => println!("Parsed placement/instance list -> {}", out_path.display()),
-                    Err(e) => {
-                        eprintln!("Error parsing placement file '{}': {}", path.display(), e);
-                        std::process::exit(1);
-                    }
-                }
-            }
-            None => {
-                eprintln!(
-                    "Placement file (index {}) not found on disk under '{}'; was --skip-export used without it present?",
-                    pm.index, args.out
-                );
-                std::process::exit(1);
-            }
+        if write_placements(&args.out, pm.as_ref(), &cell_pms, &output_dir) > 0 {
+            std::process::exit(1);
         }
 
         if !args.no_cleanup {
             match std::fs::remove_dir_all(&args.out) {
                 Ok(()) => println!("Removed temporary export directory '{}'.", args.out),
-                Err(e) => eprintln!(
-                    "Warning: failed to remove temporary directory '{}': {}",
-                    args.out, e
-                ),
+                Err(e) => eprintln!("Warning: failed to remove temporary directory '{}': {}", args.out, e),
             }
         }
 
@@ -632,9 +698,13 @@ fn main() {
             None
         }
     };
-    if let Some(pm) = &placement_match {
-        println!("Placement/instance list: index {} (arch {})", pm.index, pm.arch);
-        wanted_indices.insert(pm.index);
+    let cell_pm = match manifest::filter_cell_placement_manifest(&args.manifest, args.world) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("Failed to read cell placement matches: {}", e); Vec::new() }
+    };
+    println!("Cell placement files: {}", cell_pm.len());
+    for c in &cell_pm {
+        wanted_indices.insert(c.index);
     }
 
     let cell_archs: HashSet<u32> = result.cell_matches.iter().map(|c| c.arch).collect();
@@ -651,6 +721,7 @@ fn main() {
         .union(&placement_archs)
         .cloned()
         .collect();
+    all_archs.extend(cell_pm.iter().map(|c| c.arch));
     all_archs.sort_unstable();
     all_archs.dedup();
     println!("Archive(s) involved: {:?}", all_archs);
@@ -1004,38 +1075,7 @@ fn main() {
         println!("\nNo colour map tiles found for this world.");
     }
 
-    if let Some(pm) = &placement_match {
-        let mut found_path: Option<std::path::PathBuf> = None;
-        for entry in WalkDir::new(&args.out).into_iter().filter_map(Result::ok) {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            if path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .map(|s| s == pm.index.to_string())
-                .unwrap_or(false)
-            {
-                found_path = Some(path.to_path_buf());
-                break;
-            }
-        }
-
-        match found_path {
-            Some(path) => {
-                let out_path = output_dir.join("placement.json");
-                match placement::parse_and_write(&path, &out_path) {
-                    Ok(()) => println!("Parsed placement/instance list -> {}", out_path.display()),
-                    Err(e) => eprintln!("Error parsing placement file '{}': {}", path.display(), e),
-                }
-            }
-            None => eprintln!(
-                "Warning: placement file (index {}) not found on disk; was --skip-export used without it present?",
-                pm.index
-            ),
-        }
-    }
+    write_placements(&args.out, placement_match.as_ref(), &cell_pm, &output_dir);
 
     let total_channels = scalar_channels.len() + vec3_channels.len() + planes4_channels.len();
     if total_channels == 0 {

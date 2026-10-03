@@ -6,329 +6,382 @@
         <script src="https://cdn.plot.ly/plotly-3.6.0.min.js"></script>
         <style>
             :root {
-                --bg: #0f1216;
-                --panel: #161a20;
-                --panel-2: #1d222a;
-                --border: #2a303a;
-                --text: #e6e9ee;
-                --muted: #8892a0;
-                --accent: #5ec8d8;
-                --accent-2: #e8a33d;
+                --bg: #0f1216; --panel: #161a20; --panel-2: #1d222a; --border: #2a303a;
+                --text: #e6e9ee; --muted: #8892a0; --accent: #5ec8d8; --accent-2: #e8a33d;
             }
             * { box-sizing: border-box; }
             body {
-                margin: 0;
-                background: var(--bg);
-                color: var(--text);
+                margin: 0; background: var(--bg); color: var(--text);
                 font-family: 'Segoe UI', Roboto, -apple-system, sans-serif;
-                display: flex;
-                height: 100vh;
-                overflow: hidden;
+                display: flex; height: 100vh; overflow: hidden;
             }
             #sidebar {
-                width: 300px;
-                min-width: 300px;
-                background: var(--panel);
-                border-right: 1px solid var(--border);
-                padding: 20px;
-                overflow-y: auto;
-                display: flex;
-                flex-direction: column;
-                gap: 18px;
+                width: 300px; min-width: 300px; background: var(--panel);
+                border-right: 1px solid var(--border); padding: 20px; overflow-y: auto;
+                display: flex; flex-direction: column; gap: 18px;
             }
-            h1 {
-                font-size: 15px;
-                letter-spacing: 0.06em;
-                text-transform: uppercase;
-                color: var(--muted);
-                margin: 0 0 2px 0;
-                font-weight: 600;
-            }
+            h1 { font-size: 15px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin: 0 0 2px 0; font-weight: 600; }
             h1 span { color: var(--accent); }
             .sub { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
-
             .drop {
-                border: 1.5px dashed var(--border);
-                border-radius: 8px;
-                padding: 22px 14px;
-                text-align: center;
-                font-size: 13px;
-                color: var(--muted);
-                cursor: pointer;
+                border: 1.5px dashed var(--border); border-radius: 8px; padding: 18px 14px;
+                text-align: center; font-size: 13px; color: var(--muted);
                 transition: border-color 0.15s, background 0.15s;
             }
-            .drop:hover, .drop.drag { border-color: var(--accent); background: rgba(94,200,216,0.06); }
+            .drop.drag { border-color: var(--accent); background: rgba(94,200,216,0.06); }
             .drop input { display: none; }
             .drop strong { color: var(--text); }
-
-            .section {
-                border-top: 1px solid var(--border);
-                padding-top: 16px;
-                display: flex;
-                flex-direction: column;
-                gap: 10px;
+            .btns { display: flex; gap: 8px; margin-top: 10px; justify-content: center; }
+            button {
+                background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+                border-radius: 5px; padding: 6px 10px; font-size: 12px; cursor: pointer;
             }
+            button:hover { border-color: var(--accent); }
+            .section { border-top: 1px solid var(--border); padding-top: 16px; display: flex; flex-direction: column; gap: 10px; }
             .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
             label.toggle { display: flex; align-items: center; gap: 8px; font-size: 13px; cursor: pointer; user-select: none; }
             input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
             input[type="range"] { width: 100%; accent-color: var(--accent); }
-            select {
-                background: var(--panel-2);
-                color: var(--text);
-                border: 1px solid var(--border);
-                border-radius: 5px;
-                padding: 5px 8px;
-                font-size: 13px;
-            }
+            select { background: var(--panel-2); color: var(--text); border: 1px solid var(--border); border-radius: 5px; padding: 5px 8px; font-size: 13px; }
             .stat { font-size: 12px; color: var(--muted); }
             .stat b { color: var(--text); font-weight: 600; }
             .rangeLabel { font-size: 12px; color: var(--muted); display: flex; justify-content: space-between; }
             #status { font-size: 12px; color: var(--accent-2); min-height: 16px; }
+            #fileList { max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 4px; }
+            .fileRow { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+            .fileRow .dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+            .fileRow .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            .fileRow .ct { color: var(--muted); }
             #plot { flex: 1; height: 100vh; }
-            #empty {
-                flex: 1; display: flex; align-items: center; justify-content: center;
-                color: var(--muted); font-size: 14px; text-align: center; padding: 40px;
-            }
+            #empty { flex: 1; display: flex; align-items: center; justify-content: center; color: var(--muted); font-size: 14px; text-align: center; padding: 40px; }
         </style>
     </head>
     <body>
 
         <div id="sidebar">
-        <div>
-            <h1>ESO <span>Placement</span> Viewer</h1>
-            <div class="sub">3D instances + R-tree bounding volumes</div>
-        </div>
-
-        <div class="drop" id="drop">
-            Drop JSON file here, or <strong>click to browse</strong><br>
-            <span style="font-size:11px;">(output of parse_eso_placement.py)</span>
-            <input type="file" id="fileInput" accept=".json,application/json">
-        </div>
-
-        <div id="status"></div>
-
-        <div class="section" id="controls" style="display:none;">
-            <div class="row"><label class="toggle"><input type="checkbox" id="showInstances" checked> Instances (points)</label></div>
-            <div class="row"><label class="toggle"><input type="checkbox" id="showLeaves"> R-tree leaf boxes</label></div>
-            <div class="row"><label class="toggle"><input type="checkbox" id="showNodes"> R-tree node boxes</label></div>
-
             <div>
-                <div class="rangeLabel"><span>Max node depth drawn</span><span id="depthVal">2</span></div>
-                <input type="range" id="depthSlider" min="0" max="12" value="2">
+                <h1>ESO <span>Placement</span> Viewer</h1>
+                <div class="sub">3D instances + R-tree bounding volumes</div>
             </div>
 
-            <div class="row">
-                <label class="sub" style="margin:0;">Color instances by</label>
-                <select id="colorBy">
-                    <option value="model_type_id">model_type_id</option>
-                    <option value="none">single color</option>
-                </select>
+            <div class="drop" id="drop">
+                Drop a <strong>folder</strong> or JSON files here<br>
+                <span style="font-size:11px;">(output of parse_eso_placement.py)</span>
+                <div class="btns">
+                    <button id="btnFolder">Add folder</button>
+                    <button id="btnFiles">Add files</button>
+                    <button id="btnClear">Clear</button>
+                </div>
+                <input type="file" id="folderInput" webkitdirectory multiple>
+                <input type="file" id="fileInput" accept=".json,application/json" multiple>
             </div>
 
-            <div class="row">
-                <label class="sub" style="margin:0;">Point size</label>
-                <input type="range" id="ptSize" min="1" max="8" value="3" style="width:120px;">
+            <div id="status"></div>
+
+            <div class="section" id="filesBox" style="display:none;">
+                <div class="sub" style="margin:0;">Loaded files</div>
+                <div id="fileList"></div>
+            </div>
+
+            <div class="section" id="controls" style="display:none;">
+                <div class="row"><label class="toggle"><input type="checkbox" id="showInstances" checked> Instances (points)</label></div>
+                <div class="row"><label class="toggle"><input type="checkbox" id="showLeaves"> R-tree leaf boxes</label></div>
+                <div class="row"><label class="toggle"><input type="checkbox" id="showNodes"> R-tree node boxes</label></div>
+
+                <div>
+                    <div class="rangeLabel"><span>Max node depth drawn</span><span id="depthVal">2</span></div>
+                    <input type="range" id="depthSlider" min="0" max="12" value="2">
+                </div>
+
+                <div class="row">
+                    <label class="sub" style="margin:0;">Color instances by</label>
+                    <select id="colorBy">
+                        <option value="source_file">source file</option>
+                        <option value="model_type_id">model_type_id</option>
+                        <option value="none">single color</option>
+                    </select>
+                </div>
+
+                <div class="row"><label class="toggle"><input type="checkbox" id="useCells" checked> Place by filename cell</label></div>
+                <div class="row">
+                    <label class="sub" style="margin:0;">Cell size (world units)</label>
+                    <input type="number" id="cellSize" value="64" min="0" step="any" style="width:90px;background:var(--panel-2);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:5px 8px;">
+                </div>
+
+                <div class="row">
+                    <label class="sub" style="margin:0;">Point size</label>
+                    <input type="range" id="ptSize" min="1" max="8" value="3" style="width:120px;">
+                </div>
+            </div>
+
+            <div class="section" id="statsBox" style="display:none;">
+                <div class="stat">Files shown: <b id="statFiles">0</b></div>
+                <div class="stat">Instances: <b id="statInstances">0</b></div>
+                <div class="stat">R-tree root trees: <b id="statTrees">0</b></div>
+                <div class="stat">Leaf boxes (total): <b id="statLeaves">0</b></div>
+                <div class="stat">Node boxes (total): <b id="statNodes">0</b></div>
             </div>
         </div>
 
-        <div class="section" id="statsBox" style="display:none;">
-            <div class="stat">Instances: <b id="statInstances">0</b></div>
-            <div class="stat">R-tree root trees: <b id="statTrees">0</b></div>
-            <div class="stat">Leaf boxes (total): <b id="statLeaves">0</b></div>
-            <div class="stat">Node boxes (total): <b id="statNodes">0</b></div>
-        </div>
-        </div>
-
-        <div id="empty">Load a JSON file (from parse_eso_placement.py) to visualize.</div>
+        <div id="empty">Load a folder or JSON files (from parse_eso_placement.py) to visualize.</div>
         <div id="plot" style="display:none;"></div>
 
         <script>
-            let DATA = null;
-            let allLeafBoxes = [];   // {bbox, object_id, depth}
-            let allNodeBoxes = [];   // {bbox, level, depth}
+            // Each loaded file: {name, visible, color, off:[x,y,z], instances, leaves, nodes, treeCount}
+            // Coordinates are treated as world-space. If a file has a top-level "offset" or "origin"
+            // ([x,y,z] or {x,y,z}), it is added to every position/box in that file.
+            const FILES = [];
+            const PALETTE = ['#5ec8d8','#e8a33d','#9b7bea','#6fcf7f','#ef6f6f','#4f8df0','#e86fb5','#c9d65a','#f09a5b','#7fd6c2'];
 
-            const dropEl = document.getElementById('drop');
-            const fileInput = document.getElementById('fileInput');
-            const statusEl = document.getElementById('status');
+            const $ = id => document.getElementById(id);
+            const dropEl = $('drop'), statusEl = $('status');
 
-            dropEl.addEventListener('click', () => fileInput.click());
+            $('btnFolder').onclick = () => $('folderInput').click();
+            $('btnFiles').onclick = () => $('fileInput').click();
+            $('btnClear').onclick = () => { FILES.length = 0; refresh(); statusEl.textContent = 'Cleared.'; };
+            $('folderInput').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
+            $('fileInput').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
+
             dropEl.addEventListener('dragover', e => { e.preventDefault(); dropEl.classList.add('drag'); });
             dropEl.addEventListener('dragleave', () => dropEl.classList.remove('drag'));
-            dropEl.addEventListener('drop', e => {
-            e.preventDefault();
-            dropEl.classList.remove('drag');
-            if (e.dataTransfer.files.length) loadFile(e.dataTransfer.files[0]);
-            });
-            fileInput.addEventListener('change', e => {
-            if (e.target.files.length) loadFile(e.target.files[0]);
-            });
-
-            function loadFile(file) {
-            statusEl.textContent = 'Reading ' + file.name + ' ...';
-            const reader = new FileReader();
-            reader.onload = evt => {
-                try {
-                const json = JSON.parse(evt.target.result);
-                DATA = json;
-                statusEl.textContent = 'Loaded ' + file.name;
-                prepData();
-                render();
-                document.getElementById('controls').style.display = 'flex';
-                document.getElementById('statsBox').style.display = 'flex';
-                document.getElementById('empty').style.display = 'none';
-                document.getElementById('plot').style.display = 'block';
-                window.dispatchEvent(new Event('resize'));
-                } catch (err) {
-                statusEl.textContent = 'Error parsing JSON: ' + err.message;
+            dropEl.addEventListener('drop', async e => {
+                e.preventDefault();
+                dropEl.classList.remove('drag');
+                // Entries must be grabbed synchronously, before any await
+                const items = [...(e.dataTransfer.items || [])];
+                const entries = items.map(i => i.webkitGetAsEntry && i.webkitGetAsEntry()).filter(Boolean);
+                let files;
+                if (entries.length) {
+                    files = [];
+                    for (const en of entries) await collect(en, files);
+                } else {
+                    files = [...e.dataTransfer.files];
                 }
-            };
-            reader.onerror = () => { statusEl.textContent = 'Error reading file.'; };
-            reader.readAsText(file);
-            }
+                addFiles(files);
+            });
 
-            function prepData() {
-            allLeafBoxes = [];
-            allNodeBoxes = [];
-            const trees = DATA.trees || [];
-            document.getElementById('statTrees').textContent = trees.length;
-            document.getElementById('statInstances').textContent = (DATA.instances || []).length;
-
-            function walk(node, depth) {
-                allNodeBoxes.push({ bbox: node.bbox, level: node.level, depth: depth });
-                if (node.level === 0 && node.leaves) {
-                node.leaves.forEach(l => allLeafBoxes.push({ bbox: l.bbox, object_id: l.object_id, depth: depth + 1 }));
-                } else if (node.children) {
-                node.children.forEach(c => walk(c, depth + 1));
+            async function collect(entry, out) {
+                if (entry.isFile) {
+                    const f = await new Promise((res, rej) => entry.file(res, rej));
+                    try { Object.defineProperty(f, '_path', { value: entry.fullPath.replace(/^\//, '') }); } catch (_) {}
+                    out.push(f);
+                } else if (entry.isDirectory) {
+                    const reader = entry.createReader();
+                    while (true) {
+                        const batch = await new Promise((res, rej) => reader.readEntries(res, rej));
+                        if (!batch.length) break;
+                        for (const c of batch) await collect(c, out);
+                    }
                 }
             }
-            trees.forEach(t => walk(t, 0));
 
-            document.getElementById('statLeaves').textContent = allLeafBoxes.length;
-            document.getElementById('statNodes').textContent = allNodeBoxes.length;
-
-            let maxDepth = 0;
-            allNodeBoxes.forEach(n => { if (n.depth > maxDepth) maxDepth = n.depth; });
-            const slider = document.getElementById('depthSlider');
-            slider.max = Math.max(maxDepth, 1);
-            slider.value = Math.min(2, maxDepth);
-            document.getElementById('depthVal').textContent = slider.value;
+            function getOffset(json) {
+                const o = json.offset || json.origin;
+                if (Array.isArray(o) && o.length >= 3) return [+o[0] || 0, +o[1] || 0, +o[2] || 0];
+                if (o && typeof o === 'object') return [+o.x || 0, +o.y || 0, +o.z || 0];
+                return [0, 0, 0];
             }
 
-            // Build wireframe edges for a box [minx,miny,minz,maxx,maxy,maxz] as one Scatter3d line trace segment set
-            function boxEdges(bbox) {
-            const [x0,y0,z0,x1,y1,z1] = bbox;
-            const corners = [
-                [x0,y0,z0],[x1,y0,z0],[x1,y1,z0],[x0,y1,z0],
-                [x0,y0,z1],[x1,y0,z1],[x1,y1,z1],[x0,y1,z1]
-            ];
-            const edges = [
-                [0,1],[1,2],[2,3],[3,0],
-                [4,5],[5,6],[6,7],[7,4],
-                [0,4],[1,5],[2,6],[3,7]
-            ];
-            const xs=[], ys=[], zs=[];
-            edges.forEach(([a,b]) => {
-                xs.push(corners[a][0], corners[b][0], null);
-                ys.push(corners[a][1], corners[b][1], null);
-                zs.push(corners[a][2], corners[b][2], null);
-            });
-            return {xs, ys, zs};
+            function prepFile(name, json) {
+                const off = getOffset(json);
+                const leaves = [], nodes = [];
+                const base = name.split(/[\\/]/).pop();
+                const m = base.match(/x(-?\d+)_z(-?\d+)/i);
+                const cell = m ? [parseInt(m[1], 10), parseInt(m[2], 10)] : null;
+                const walk = (node, depth) => {
+                    nodes.push({ bbox: node.bbox, depth });
+                    if (node.level === 0 && node.leaves) {
+                        node.leaves.forEach(l => leaves.push({ bbox: l.bbox, depth: depth + 1 }));
+                    } else if (node.children) {
+                        node.children.forEach(c => walk(c, depth + 1));
+                    }
+                };
+                const trees = json.trees || [];
+                trees.forEach(t => walk(t, 0));
+                return { name, visible: true, off, cell, instances: json.instances || [], leaves, nodes, treeCount: trees.length };
             }
 
-            function boxesToTrace(boxes, color, name, width) {
-            let xs=[], ys=[], zs=[];
-            boxes.forEach(b => {
-                const e = boxEdges(b.bbox);
-                xs = xs.concat(e.xs); ys = ys.concat(e.ys); zs = zs.concat(e.zs);
-            });
-            return {
-                type: 'scatter3d', mode: 'lines', x: xs, y: ys, z: zs,
-                line: { color: color, width: width || 2 },
-                name: name, hoverinfo: 'skip', opacity: 0.6
-            };
+            async function addFiles(list) {
+                const jsons = list.filter(f => /\.json$/i.test(f.name));
+                if (!jsons.length) { statusEl.textContent = 'No .json files found.'; return; }
+                let ok = 0, bad = 0;
+                for (let i = 0; i < jsons.length; i++) {
+                    const f = jsons[i];
+                    const name = f._path || f.webkitRelativePath || f.name;
+                    statusEl.textContent = `Reading ${i + 1}/${jsons.length}: ${f.name}`;
+                    try {
+                        const data = JSON.parse(await f.text());
+                        const entry = prepFile(name, data);
+                        const idx = FILES.findIndex(x => x.name === name);
+                        if (idx >= 0) FILES[idx] = entry; else FILES.push(entry);
+                        ok++;
+                    } catch (err) {
+                        bad++; console.warn('Failed to load', name, err);
+                    }
+                    if (i % 10 === 9) await new Promise(r => setTimeout(r));
+                }
+                FILES.forEach((f, i) => f.color = PALETTE[i % PALETTE.length]);
+                statusEl.textContent = `Loaded ${ok} file(s)` + (bad ? `, ${bad} failed (see console)` : '');
+                refresh();
             }
 
-            function render() {
-            const traces = [];
-            const showInstances = document.getElementById('showInstances').checked;
-            const showLeaves = document.getElementById('showLeaves').checked;
-            const showNodes = document.getElementById('showNodes').checked;
-            const maxDepth = parseInt(document.getElementById('depthSlider').value, 10);
-            const colorBy = document.getElementById('colorBy').value;
-            const ptSize = parseInt(document.getElementById('ptSize').value, 10);
-
-            if (showInstances && DATA.instances) {
-                const inst = DATA.instances;
-                const hover = inst.map(i =>
-                'instance_id: ' + i.instance_id +
-                '<br>model_type_id: ' + i.model_type_id +
-                '<br>pos: (' + i.pos_x.toFixed(2) + ', ' + i.pos_y.toFixed(2) + ', ' + i.pos_z.toFixed(2) + ')' +
-                '<br>rot: (' + i.rot_x.toFixed(3) + ', ' + i.rot_y.toFixed(3) + ', ' + i.rot_z.toFixed(3) + ')'
-                );
-                traces.push({
-                type: 'scatter3d', mode: 'markers',
-                x: inst.map(i => i.pos_x), y: inst.map(i => i.pos_z), z: inst.map(i => i.pos_y),
-                text: hover, hoverinfo: 'text',
-                marker: {
-                    size: ptSize,
-                    color: colorBy === 'model_type_id' ? inst.map(i => i.model_type_id) : '#5ec8d8',
-                    colorscale: 'Turbo',
-                    showscale: colorBy === 'model_type_id',
-                    opacity: 0.85
-                },
-                name: 'Instances'
+            function buildFileList() {
+                const box = $('fileList');
+                box.innerHTML = '';
+                FILES.forEach(f => {
+                    const row = document.createElement('label');
+                    row.className = 'fileRow';
+                    const cb = document.createElement('input');
+                    cb.type = 'checkbox'; cb.checked = f.visible;
+                    cb.onchange = () => { f.visible = cb.checked; updateStats(); render(); };
+                    const dot = document.createElement('span'); dot.className = 'dot'; dot.style.background = f.color;
+                    const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = f.name; nm.title = f.name;
+                    const ct = document.createElement('span'); ct.className = 'ct'; ct.textContent = f.instances.length;
+                    row.append(cb, dot, nm, ct);
+                    box.appendChild(row);
                 });
             }
 
-            if (showNodes) {
-                const filtered = allNodeBoxes.filter(n => n.depth <= maxDepth);
-                if (filtered.length) traces.push(boxesToTraceSwapAxes(filtered, '#e8a33d', 'R-tree nodes', 2));
-            }
-            if (showLeaves) {
-                const filtered = allLeafBoxes.filter(n => n.depth <= maxDepth + 1);
-                if (filtered.length) traces.push(boxesToTraceSwapAxes(filtered, '#5ec8d8', 'R-tree leaves', 1));
-            }
+            const visibleFiles = () => FILES.filter(f => f.visible);
 
-            const layout = {
-                paper_bgcolor: '#0f1216',
-                plot_bgcolor: '#0f1216',
-                font: { color: '#e6e9ee' },
-                margin: { l: 0, r: 0, t: 10, b: 0 },
-                scene: {
-                xaxis: { title: 'X', gridcolor: '#2a303a', color: '#8892a0', backgroundcolor: '#0f1216' },
-                yaxis: { title: 'Z', gridcolor: '#2a303a', color: '#8892a0', backgroundcolor: '#0f1216', autorange: 'reversed' },
-                zaxis: { title: 'Y (up)', gridcolor: '#2a303a', color: '#8892a0', backgroundcolor: '#0f1216' },
-                aspectmode: 'data'
-                },
-                showlegend: true,
-                legend: { font: { color: '#e6e9ee' } }
-            };
-
-            Plotly.react('plot', traces, layout, { responsive: true, displaylogo: false });
+            // Effective offset = JSON offset + (cell index * cell size) when enabled. Cell x -> world X, cell z -> world Z.
+            function eff(f) {
+                const o = f.off.slice();
+                if ($('useCells').checked && f.cell) {
+                    const s = parseFloat($('cellSize').value) || 0;
+                    o[0] += f.cell[0] * s;
+                    o[2] += f.cell[1] * s;
+                }
+                return o;
             }
 
-            // Note: game coords are (x, y-up, z) -> plot as (x, z, y) so "up" reads naturally in the 3D view
-            function boxesToTraceSwapAxes(boxes, color, name, width) {
-            let xs=[], ys=[], zs=[];
-            boxes.forEach(b => {
-                const [x0,y0,z0,x1,y1,z1] = b.bbox;
-                const swapped = [x0,z0,y0,x1,z1,y1];
-                const e = boxEdges(swapped);
-                xs = xs.concat(e.xs); ys = ys.concat(e.ys); zs = zs.concat(e.zs);
+            function updateStats() {
+                const v = visibleFiles();
+                const sum = fn => v.reduce((a, f) => a + fn(f), 0);
+                $('statFiles').textContent = v.length + ' / ' + FILES.length;
+                $('statInstances').textContent = sum(f => f.instances.length).toLocaleString();
+                $('statTrees').textContent = sum(f => f.treeCount).toLocaleString();
+                $('statLeaves').textContent = sum(f => f.leaves.length).toLocaleString();
+                $('statNodes').textContent = sum(f => f.nodes.length).toLocaleString();
+            }
+
+            function refresh() {
+                const has = FILES.length > 0;
+                ['filesBox', 'controls', 'statsBox'].forEach(id => $(id).style.display = has ? 'flex' : 'none');
+                $('empty').style.display = has ? 'none' : 'flex';
+                $('plot').style.display = has ? 'block' : 'none';
+                if (!has) { Plotly.purge('plot'); return; }
+
+                let maxDepth = 1;
+                FILES.forEach(f => f.nodes.forEach(n => { if (n.depth > maxDepth) maxDepth = n.depth; }));
+                const slider = $('depthSlider');
+                const prev = parseInt(slider.value, 10);
+                slider.max = maxDepth;
+                slider.value = Math.min(isNaN(prev) ? 2 : prev, maxDepth);
+                $('depthVal').textContent = slider.value;
+
+                buildFileList();
+                updateStats();
+                render();
+                window.dispatchEvent(new Event('resize'));
+            }
+
+            // Game coords are (x, y-up, z); plot as (x, z, y) so "up" reads naturally.
+            const EDGES = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
+            function boxesToTrace(boxes, color, name, width) {
+                const xs = [], ys = [], zs = [];
+                for (const b of boxes) {
+                    const [x0, y0, z0, x1, y1, z1] = b.bbox;
+                    const [ox, oy, oz] = b.off;
+                    const X0 = x0 + ox, Y0 = z0 + oz, Z0 = y0 + oy, X1 = x1 + ox, Y1 = z1 + oz, Z1 = y1 + oy;
+                    const c = [
+                        [X0,Y0,Z0],[X1,Y0,Z0],[X1,Y1,Z0],[X0,Y1,Z0],
+                        [X0,Y0,Z1],[X1,Y0,Z1],[X1,Y1,Z1],[X0,Y1,Z1]
+                    ];
+                    for (const [a, d] of EDGES) {
+                        xs.push(c[a][0], c[d][0], null);
+                        ys.push(c[a][1], c[d][1], null);
+                        zs.push(c[a][2], c[d][2], null);
+                    }
+                }
+                return {
+                    type: 'scatter3d', mode: 'lines', x: xs, y: ys, z: zs,
+                    line: { color, width: width || 2 }, name, hoverinfo: 'skip', opacity: 0.6
+                };
+            }
+
+            function render() {
+                if (!FILES.length) return;
+                const traces = [];
+                const vis = visibleFiles();
+                const showInstances = $('showInstances').checked;
+                const showLeaves = $('showLeaves').checked;
+                const showNodes = $('showNodes').checked;
+                const maxDepth = parseInt($('depthSlider').value, 10);
+                const colorBy = $('colorBy').value;
+                const ptSize = parseInt($('ptSize').value, 10);
+
+                if (showInstances) {
+                    const x = [], y = [], z = [], text = [], col = [];
+                    for (const f of vis) {
+                        const [ox, oy, oz] = eff(f);
+                        for (const i of f.instances) {
+                            const px = i.pos_x + ox, py = i.pos_y + oy, pz = i.pos_z + oz;
+                            x.push(px); y.push(pz); z.push(py);
+                            text.push(
+                                'file: ' + f.name +
+                                '<br>instance_id: ' + i.instance_id +
+                                '<br>model_type_id: ' + i.model_type_id +
+                                '<br>pos: (' + px.toFixed(2) + ', ' + py.toFixed(2) + ', ' + pz.toFixed(2) + ')' +
+                                '<br>rot: (' + i.rot_x.toFixed(3) + ', ' + i.rot_y.toFixed(3) + ', ' + i.rot_z.toFixed(3) + ')'
+                            );
+                            col.push(colorBy === 'model_type_id' ? i.model_type_id : colorBy === 'source_file' ? f.color : '#5ec8d8');
+                        }
+                    }
+                    if (x.length) {
+                        traces.push({
+                            type: 'scatter3d', mode: 'markers', x, y, z, text, hoverinfo: 'text',
+                            marker: {
+                                size: ptSize, color: col, colorscale: 'Turbo',
+                                showscale: colorBy === 'model_type_id', opacity: 0.85
+                            },
+                            name: 'Instances'
+                        });
+                    }
+                }
+
+                if (showNodes) {
+                    const boxes = vis.flatMap(f => { const off = eff(f); return f.nodes.filter(n => n.depth <= maxDepth).map(n => ({ bbox: n.bbox, off })); });
+                    if (boxes.length) traces.push(boxesToTrace(boxes, '#e8a33d', 'R-tree nodes', 2));
+                }
+                if (showLeaves) {
+                    const boxes = vis.flatMap(f => { const off = eff(f); return f.leaves.filter(n => n.depth <= maxDepth + 1).map(n => ({ bbox: n.bbox, off })); });
+                    if (boxes.length) traces.push(boxesToTrace(boxes, '#5ec8d8', 'R-tree leaves', 1));
+                }
+
+                const layout = {
+                    paper_bgcolor: '#0f1216', plot_bgcolor: '#0f1216',
+                    font: { color: '#e6e9ee' },
+                    margin: { l: 0, r: 0, t: 10, b: 0 },
+                    scene: {
+                        xaxis: { title: 'X', gridcolor: '#2a303a', color: '#8892a0', backgroundcolor: '#0f1216' },
+                        yaxis: { title: 'Z', gridcolor: '#2a303a', color: '#8892a0', backgroundcolor: '#0f1216', autorange: 'reversed' },
+                        zaxis: { title: 'Y (up)', gridcolor: '#2a303a', color: '#8892a0', backgroundcolor: '#0f1216' },
+                        aspectmode: 'data'
+                    },
+                    showlegend: true,
+                    legend: { font: { color: '#e6e9ee' } }
+                };
+
+                Plotly.react('plot', traces, layout, { responsive: true, displaylogo: false });
+            }
+
+            ['showInstances', 'showLeaves', 'showNodes', 'colorBy', 'ptSize', 'useCells', 'cellSize'].forEach(id => {
+                $(id).addEventListener('input', render);
             });
-            return {
-                type: 'scatter3d', mode: 'lines', x: xs, y: ys, z: zs,
-                line: { color: color, width: width || 2 },
-                name: name, hoverinfo: 'skip', opacity: 0.6
-            };
-            }
-
-            ['showInstances','showLeaves','showNodes','colorBy','ptSize'].forEach(id => {
-            document.getElementById(id).addEventListener('input', () => { if (DATA) render(); });
-            });
-            document.getElementById('depthSlider').addEventListener('input', e => {
-            document.getElementById('depthVal').textContent = e.target.value;
-            if (DATA) render();
+            $('depthSlider').addEventListener('input', e => {
+                $('depthVal').textContent = e.target.value;
+                render();
             });
         </script>
     </body>

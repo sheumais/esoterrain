@@ -4,6 +4,7 @@ pub const WORLD_MASK: u32 = 0x7FF;
 pub const TYPE_MASK: u32 = 0x1F;
 pub const PLACEMENT_CATEGORY: u32 = 0x4800_0000;
 pub const PLACEMENT_TYPE: u32 = 0x02;
+pub const CELL_PLACEMENT_TYPE: u32 = 0x15;
 
 #[derive(Debug, Clone, Copy)]
 pub struct TocMatch {
@@ -328,3 +329,65 @@ pub fn filter_table_manifest(
     }
     Ok(None)
 }
+
+#[derive(Debug, Clone, Copy)]
+pub struct CellPlacementMatch {
+    pub index: u32,
+    pub x: u32,
+    pub z: u32,
+    pub arch: u32,
+}
+
+pub fn filter_cell_placement_manifest(manifest_path: &str, world: u32) -> io::Result<Vec<CellPlacementMatch>> {
+    let content = std::fs::read_to_string(manifest_path)?;
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let row: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
+        if row.len() < 11 { continue; }
+        let (index, file_index, unk1, arch) = match (parse_int(row[0]), parse_int(row[2]), parse_int(row[3]), parse_int(row[9])) {
+            (Some(i), Some(f), Some(u), Some(a)) => (i as u32, f as u32, u as u32, a as u32),
+            _ => continue,
+        };
+        if (unk1 >> 16) != CELL_HIGH_MARKER
+            || ((unk1 >> 5) & WORLD_MASK) != world
+            || (unk1 & TYPE_MASK) != CELL_PLACEMENT_TYPE
+        { continue; }
+        out.push(CellPlacementMatch { index, x: file_index >> 16, z: file_index & 0xFFFF, arch });
+    }
+    Ok(out)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SizeEntry {
+    pub ty: u32,
+    pub x: u32,
+    pub z: u32,
+    pub size: u32,
+
+}
+
+pub fn filter_size_manifest(manifest_path: &str, world: u32) -> io::Result<Vec<SizeEntry>> {
+    let content = std::fs::read_to_string(manifest_path)?;
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let row: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
+        if row.len() < 11 {
+            continue;
+        }
+        let (file_index, unk1, size) = match (parse_int(row[2]), parse_int(row[3]), parse_int(row[4])) {
+            (Some(fi), Some(u), Some(sz)) => (fi as u32, u as u32, sz as u32),
+            _ => continue,
+        };
+        if (unk1 >> 16) != CELL_HIGH_MARKER || ((unk1 >> 5) & WORLD_MASK) != world {
+            continue;
+        }
+        out.push(SizeEntry {
+            ty: unk1 & TYPE_MASK,
+            x: file_index >> 16,
+            z: file_index & 0xFFFF,
+            size,
+        });
+    }
+    Ok(out)
+}
+
