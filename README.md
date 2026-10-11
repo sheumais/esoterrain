@@ -8,6 +8,8 @@ Discord messages from `@thefalcon19` in the ESO Model Viewer [discord](https://d
 
 https://github.com/uesp/uesp-esoapps/blob/master/EsoLand/EsoLand/EsoLand.cpp
 
+https://knockout.chat/thread/12222/
+
 ![Northern Elsweyr Render](northern_elsweyr_colour.png)
 
 

@@ -148,8 +148,8 @@ Options:\n  \
 --skip-export        Skip calling the exporter; assume files are already on disk\n  \
 --no-cleanup         Keep every file the archive export dumped\n  \
 --size-map           Write a rough zone-shape image from manifest file sizes (needs <world>; no export)\n  \
---size-type <n>     File type (low 5 bits of Unk1) to use for --size-map (default: 0x15, cell placement files)\n  \
---size-scale <n>    Pixels per cell in the --size-map image (default: 16)\n  \
+--size-type <n>      File type (low 5 bits of Unk1) to use for --size-map (default: 0x15, cell placement files)\n  \
+--size-scale <n>     Pixels per cell in the --size-map image (default: 16)\n  \
 --placement-only     Only export/parse the placement (instance) file for this world; skip terrain/colourmap entirely\n  \
 --list-worlds        List every world found in the manifest with terrain cell data, and its grid size (no export/world arg needed)\n \
 --world-lut          Export the world table and write export/worlds_lut.csv\n \
@@ -367,7 +367,6 @@ fn main() {
         }
         return;
     }
-
 
     if args.placement_only {
         println!("Placement-only mode: looking up instance list for world 0x{:x}...", args.world);

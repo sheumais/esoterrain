@@ -12,8 +12,8 @@ const TEX_OFFSET: usize = 57;
 const CREATURE_LINK_OFFSET: usize = 0x98;
 const LINK_MODEL_ROW_OFFSET: usize = 57;
 const DEFAULT_MODEL: u32 = 55707;
-const DEFAULT_SKELETON: u32 = 849;
-const DEFAULT_TEX_ROW: u32 = 1043;
+const _DEFAULT_SKELETON: u32 = 849;
+const _DEFAULT_TEX_ROW: u32 = 1043;
 
 pub fn be24(b: &[u8], o: usize) -> Option<u32> {
     b.get(o..o + 3).map(|s| u32::from_be_bytes([0, s[0], s[1], s[2]]))
@@ -55,6 +55,7 @@ fn resolve(c: &[u8], links: &Table, models: &Table, textures: &Table) -> Option<
 pub struct Table {
     data: Vec<u8>,
     spans: Vec<(u32, usize, usize)>,
+    #[allow(unused)]
     by_id: HashMap<u32, usize>,
     by_row: HashMap<u32, usize>,
 }
@@ -91,10 +92,6 @@ impl Table {
     fn entry(&self, i: usize) -> &[u8] {
         let (_, s, l) = self.spans[i];
         &self.data[s..s + l]
-    }
-
-    pub fn get(&self, id: u32) -> Option<&[u8]> {
-        self.by_id.get(&id).map(|&i| self.entry(i))
     }
 
     pub fn get_by_row(&self, row: u32) -> Option<&[u8]> {

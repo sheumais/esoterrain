@@ -377,10 +377,6 @@ pub struct BigImage {
     pixels: Vec<u16>,
     dim_x: u32,
     dim_y: u32,
-    tile_w: u32,
-    tile_h: u32,
-    grid_w: u32,
-    grid_h: u32,
     initialized: bool,
 }
 
@@ -389,19 +385,11 @@ impl BigImage {
         pixels: Vec<u16>,
         dim_x: u32,
         dim_y: u32,
-        tile_w: u32,
-        tile_h: u32,
-        grid_w: u32,
-        grid_h: u32,
     ) -> Self {
         Self {
             pixels,
             dim_x,
             dim_y,
-            tile_w,
-            tile_h,
-            grid_w,
-            grid_h,
             initialized: true,
         }
     }
@@ -636,7 +624,7 @@ impl RawBigImage {
             })
             .collect();
         BigImage::from_pixels(
-            pixels, self.dim_x, self.dim_y, self.tile_w, self.tile_h, self.grid_w, self.grid_h,
+            pixels, self.dim_x, self.dim_y,
         )
     }
 
@@ -655,7 +643,7 @@ impl RawBigImage {
             })
             .collect();
         BigImage::from_pixels(
-            pixels, self.dim_x, self.dim_y, self.tile_w, self.tile_h, self.grid_w, self.grid_h,
+            pixels, self.dim_x, self.dim_y,
         )
     }
 }

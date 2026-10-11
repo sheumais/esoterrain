@@ -211,9 +211,6 @@ pub fn parse_and_write(
 
 #[derive(Debug, Clone)]
 pub struct WorldInfo {
-    pub zone_id: u32,
-    pub width: u32,
-    pub height: u32,
     pub world_name: String,
     pub zone_name: String,
 }
@@ -229,20 +226,12 @@ pub fn load_lut_csv(path: &Path) -> io::Result<HashMap<u32, WorldInfo>> {
         if row.len() < 7 {
             return;
         }
-        let (Ok(world), Ok(zone), Ok(w), Ok(h)) = (
-            row[0].trim().parse::<u32>(),
-            row[2].trim().parse::<u32>(),
-            row[4].trim().parse::<u32>(),
-            row[5].trim().parse::<u32>(),
-        ) else {
+        let Ok(world) = row[0].trim().parse::<u32>() else {
             return;
         };
         map.insert(
             world,
             WorldInfo {
-                zone_id: zone,
-                width: w,
-                height: h,
                 world_name: row[6].clone(),
                 zone_name: row.get(7).cloned().unwrap_or_default(),
             },
