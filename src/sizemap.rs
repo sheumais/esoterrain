@@ -75,7 +75,7 @@ pub fn run(
 
     std::fs::create_dir_all(out_dir)
         .map_err(|e| format!("Failed to create '{}': {}", out_dir.display(), e))?;
-    let path = out_dir.join(format!("world_0x{:x}_sizemap_type0x{:x}.png", world, ty));
+    let path = out_dir.join(format!("world_0x{:x}_sizemap.png", world));
     img.save(&path).map_err(|e| format!("Failed to save '{}': {}", path.display(), e))?;
     Ok(path)
 }

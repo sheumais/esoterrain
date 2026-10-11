@@ -7,8 +7,10 @@ mod placement;
 mod worldlut;
 mod model;
 mod creature;
+mod items;
 mod cell_placement;
 mod sizemap;
+mod model_export;
 
 use landfile::{fixed_channel_range, save_rgb_from_channels, LandFile, RawBigImage, RawTile};
 use manifest::filter_manifest;
@@ -26,6 +28,7 @@ const DEFAULT_OUT: &str = "./temp"; // WILL GET DELETED AFTER
 const FINAL_EXPORT_DIR: &str = "./export";
 const MNF_EXPORT: &str = "eso_mnf.csv"; // can't upload to github due to file size limits.
 const RAW_MNF: &str = "C:/Program Files (x86)/Steam/steamapps/common/Zenimax Online/The Elder Scrolls Online/depot/eso.mnf";
+const NOESIS: &str = "C:/Users/H/Documents/EsoExtractData v0.53/noesisv4474/Noesis64.exe";
 const MAX_SANE_GRID_SPAN: u32 = 128;
 
 struct Args {
@@ -43,9 +46,12 @@ struct Args {
     world_lut: bool,
     model_list: bool,
     creature_list: bool,
+    item_list: bool,
     size_map: bool,
     size_type: Option<u32>,
     size_scale: u32,
+    model_fis: Vec<u32>,
+    noesis: String,
 }
 
 fn parse_int_arg(s: &str) -> u32 {
@@ -147,17 +153,20 @@ Options:\n  \
 --dry-run            Show what would happen without exporting/deleting\n  \
 --skip-export        Skip calling the exporter; assume files are already on disk\n  \
 --no-cleanup         Keep every file the archive export dumped\n  \
+--model <FileIndex>  Export a model + textures + .obj/.mtl into export/models/ (one flat folder).\n                       Repeat the flag or use commas for several: --model 0x15b253,0x15b254\n  \
+--noesis <path>      Path to Noesis64.exe (default: {})\n  \
 --size-map           Write a rough zone-shape image from manifest file sizes (needs <world>; no export)\n  \
 --size-type <n>      File type (low 5 bits of Unk1) to use for --size-map (default: 0x15, cell placement files)\n  \
 --size-scale <n>     Pixels per cell in the --size-map image (default: 16)\n  \
 --placement-only     Only export/parse the placement (instance) file for this world; skip terrain/colourmap entirely\n  \
 --list-worlds        List every world found in the manifest with terrain cell data, and its grid size (no export/world arg needed)\n \
 --world-lut          Export the world table and write export/worlds_lut.csv\n \
---models-lut         Export the models table and write export/models_lut.csv\n \
---creatures-lut      Export the creatures table, creature models and creature textures table and write export/creatures_lut.csv\n \
+--model-lut          Export the models table and write export/models_lut.csv\n \
+--creature-lut       Export the creatures table, creature models and creature textures table and write export/creatures_lut.csv\n \
+--item-lut           Export the item visual templates (0x58), part materials (0x50), materials (0x05) and item names (0x171) tables and write export/items_lut.csv\n \
 --
 ",
-        MNF_EXPORT, RAW_MNF, DEFAULT_EXE, DEFAULT_OUT
+        MNF_EXPORT, RAW_MNF, DEFAULT_EXE, DEFAULT_OUT, NOESIS
     );
 }
 
@@ -177,9 +186,12 @@ fn parse_args() -> Args {
     let mut world_lut = false;
     let mut model_list = false;
     let mut creature_list = false;
+    let mut item_list = false;
     let mut size_map = false;
     let mut size_type: Option<u32> = None;
     let mut size_scale: u32 = 16;
+    let mut model_fis: Vec<u32> = Vec::new();
+    let mut noesis = NOESIS.to_string();
 
     let mut i = 0;
     while i < raw.len() {
@@ -213,9 +225,21 @@ fn parse_args() -> Args {
             "--world-lut" => world_lut = true,
             "--model-lut" => model_list = true,
             "--creature-lut" => creature_list = true,
+            "--item-lut" => item_list = true,
             "--size-map" => size_map = true,
 
 
+            "--noesis" => {
+                i += 1;
+                noesis = raw.get(i).cloned().expect("--noesis needs a path");
+            }
+            "--model" => {
+                i += 1;
+                let val = raw.get(i).expect("--model needs a FileIndex");
+                for part in val.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    model_fis.push(parse_int_arg(part));
+                }
+            }
             "--size-type" => {
                 i += 1;
                 size_type = Some(parse_int_arg(raw.get(i).expect("--size-type needs a value")));
@@ -235,8 +259,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    let world = if list_worlds || world_lut || model_list || creature_list {
-        // No world id needed for this mode; ignore any stray positional args.
+    let world = if !model_fis.is_empty() || list_worlds || world_lut || model_list || creature_list || item_list {
         0
     } else {
         let world_str: &String = match positional.len() {
@@ -268,9 +291,12 @@ fn parse_args() -> Args {
         world_lut,
         model_list,
         creature_list,
+        item_list,
         size_map,
         size_type,
         size_scale,
+        model_fis,
+        noesis,
     }
 }
 
@@ -350,6 +376,40 @@ fn main() {
         return;
     }
 
+    if !args.model_fis.is_empty() {
+        let models_dir = Path::new(FINAL_EXPORT_DIR).join("models");
+        let opts = model_export::Options {
+            manifest: &args.manifest,
+            exe: &args.exe,
+            mnf: &args.mnf,
+            temp_dir: &args.out,
+            out_root: &models_dir,
+            dry_run: args.dry_run,
+            skip_export: args.skip_export,
+            keep_temp: args.no_cleanup,
+            noesis: &args.noesis,
+        };
+        let total = args.model_fis.len();
+        let mut failed = 0usize;
+        for (n, fi) in args.model_fis.iter().enumerate() {
+            if total > 1 {
+                println!("\n=== Model {}/{}: 0x{:x} ===", n + 1, total, fi);
+            }
+            match model_export::run(*fi, &opts) {
+                Ok(s) => println!(
+                    "\nFinished. {} texture(s) exported, {} missing -> {}",
+                    s.textures_found, s.textures_missing, s.out_dir.display()
+                ),
+                Err(e) => { eprintln!("{}", e); failed += 1; }
+            }
+        }
+        if total > 1 {
+            println!("\nAll done: {} ok, {} failed.", total - failed, failed);
+        }
+        if failed > 0 { std::process::exit(1); }
+        return;
+    }
+
     if args.size_map {
         println!("Building size map for world 0x{:x}...", args.world);
         match sizemap::run(
@@ -390,7 +450,10 @@ fn main() {
         let mut archs: Vec<u32> = pm.iter().map(|p| p.arch).chain(cell_pms.iter().map(|c| c.arch)).collect();
         archs.sort_unstable();
         archs.dedup();
-        let wanted: HashSet<u32> = pm.iter().map(|p| p.index).chain(cell_pms.iter().map(|c| c.index)).collect();
+        let mut wanted: HashSet<u32> = pm.iter().map(|p| p.index).chain(cell_pms.iter().map(|c| c.index)).collect();
+        if let Some(p) = pm {
+            wanted.insert(p.index);
+        }
 
         if !args.skip_export {
             for arch in &archs {
@@ -415,7 +478,7 @@ fn main() {
             return;
         }
 
-        let output_dir = Path::new(FINAL_EXPORT_DIR).join(format!("world_0x{:x}_placement", args.world));
+        let output_dir = Path::new(FINAL_EXPORT_DIR).join(format!("world_0x{:x}", args.world)).join("placements");
         if let Err(e) = std::fs::create_dir_all(&output_dir) {
             eprintln!("Failed to create output directory '{}': {}", output_dir.display(), e);
             std::process::exit(1);
@@ -615,6 +678,65 @@ fn main() {
         let out_path = Path::new(FINAL_EXPORT_DIR).join("creatures_lut.csv");
         match creature::build_csv(&textures, &links, &models, &creature_tbl, &names, &out_path) {
             Ok(n) => println!("Wrote {} creatures -> {}", n, out_path.display()),
+            Err(e) => { eprintln!("Error writing '{}': {}", out_path.display(), e); std::process::exit(1); }
+        }
+        if !args.no_cleanup { let _ = std::fs::remove_dir_all(&args.out); }
+        return;
+    }
+    if args.item_list {
+        let mut found = Vec::new();
+        for (fi, label) in [
+            (items::MATERIAL_DEF, "materials"),
+            (items::ITEM_PART_MATERIAL_DEF, "part materials"),
+            (items::ITEM_VISUAL_TEMPLATE_DEF, "item visual templates"),
+            (items::ITEM_NAME_TABLE_DEF, "item names"),
+        ] {
+            match manifest::filter_table_manifest(&args.manifest, fi) {
+                Ok(Some(m)) => { println!("{}: index {} (arch {})", label, m.index, m.arch); found.push(m); }
+                Ok(None) => { eprintln!("{} (file_index 0x{:x}) not found in manifest.", label, fi); std::process::exit(1); }
+                Err(e) => { eprintln!("Failed to read manifest '{}': {}", args.manifest, e); std::process::exit(1); }
+            }
+        }
+        let mut archs: Vec<u32> = found.iter().map(|m| m.arch).collect();
+        archs.sort_unstable(); archs.dedup();
+
+        if !args.skip_export {
+            for a in &archs {
+                println!("\nExporting archive {}...", a);
+                if !export::export_archive_combined(&args.exe, &args.mnf, &args.out, *a, args.dry_run) {
+                    eprintln!("Archive export reported an error; check output above before continuing.");
+                }
+            }
+            if !args.no_cleanup {
+                let wanted: HashSet<u32> = found.iter().map(|m| m.index).collect();
+                let (kept, removed) = export::cleanup_export_dir_keeping(&args.out, &wanted, &["en.lang.csv"], args.dry_run);
+                println!("Kept {} files, removed {} files.", kept, removed);
+            }
+        }
+        if args.dry_run { println!("\nDry run complete."); return; }
+
+        let load = |m: &manifest::TableMatch, label: &str| -> creature::Table {
+            let Some(p) = find_uncompressed(&args.out, m.index) else {
+                eprintln!("{} file '{}_Uncompressed' not found under '{}'.", label, m.index, args.out);
+                std::process::exit(1);
+            };
+            creature::Table::load(&p).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); })
+        };
+        let (materials, part_mats, templates, name_tbl) = (
+            load(&found[0], "Material"), load(&found[1], "Part material"),
+            load(&found[2], "Item visual template"), load(&found[3], "Item name"),
+        );
+
+        let names = WalkDir::new(&args.out).into_iter().filter_map(Result::ok).map(|e| e.into_path())
+            .find(|p| p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some("en.lang.csv"))
+            .and_then(|p| worldlut::load_lang_group(&p, items::ITEM_NAME_GROUP).ok())
+            .unwrap_or_default();
+        println!("Loaded {} item names.", names.len());
+
+        std::fs::create_dir_all(FINAL_EXPORT_DIR).expect("failed to create export dir");
+        let out_path = Path::new(FINAL_EXPORT_DIR).join("items_lut.csv");
+        match items::build_csv(&templates, &part_mats, &materials, &name_tbl, &names, &out_path) {
+            Ok(n) => println!("Wrote {} item parts -> {}", n, out_path.display()),
             Err(e) => { eprintln!("Error writing '{}': {}", out_path.display(), e); std::process::exit(1); }
         }
         if !args.no_cleanup { let _ = std::fs::remove_dir_all(&args.out); }
@@ -858,8 +980,8 @@ fn main() {
     }
 
     let output_dir = Path::new(FINAL_EXPORT_DIR).join(format!(
-        "world_0x{:x}_x{}-{}_z{}-{}_channels",
-        args.world, min_x, max_x, min_z, max_z
+        "world_0x{:x}",
+        args.world,
     ));
     if let Err(e) = std::fs::create_dir_all(&output_dir) {
         eprintln!("Failed to create output directory '{}': {}", output_dir.display(), e);

@@ -94,6 +94,14 @@ impl Table {
         &self.data[s..s + l]
     }
 
+    pub fn len(&self) -> usize {
+        self.spans.len()
+    }
+
+    pub fn entry_at(&self, i: usize) -> &[u8] {
+        self.entry(i)
+    }
+
     pub fn get_by_row(&self, row: u32) -> Option<&[u8]> {
     self.by_row.get(&row).map(|&i| self.entry(i))
 }
