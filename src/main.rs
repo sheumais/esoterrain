@@ -11,6 +11,7 @@ mod items;
 mod cell_placement;
 mod sizemap;
 mod model_export;
+mod scene_export;
 
 use landfile::{fixed_channel_range, save_rgb_from_channels, LandFile, RawBigImage, RawTile};
 use manifest::filter_manifest;
@@ -52,6 +53,10 @@ struct Args {
     size_scale: u32,
     model_fis: Vec<u32>,
     noesis: String,
+    scene: Vec<String>,
+    cell_size: f64,
+    scene_name: Option<String>,
+    scene_script_only: bool,
 }
 
 fn parse_int_arg(s: &str) -> u32 {
@@ -155,6 +160,10 @@ Options:\n  \
 --no-cleanup         Keep every file the archive export dumped\n  \
 --model <FileIndex>  Export a model + textures + .obj/.mtl into export/models/ (one flat folder).\n                       Repeat the flag or use commas for several: --model 0x15b253,0x15b254\n  \
 --noesis <path>      Path to Noesis64.exe (default: {})\n  \
+--scene <paths>      Export every model used by placement JSON file(s) or folder(s) (comma-separated or repeated;\n                       world placement.json and cell_x#_z#.json both work), then write a Blender script that\n                       places them as collection-instance references into export/scenes/\n  \
+--cell-size <n>      World units per cell for cell_x#_z# files (default 250; 0 = don't offset)\n  \
+--scene-name <name>  Output name for the scene .py/.json (default: derived from the world_0x.. folder)\n  \
+--scene-script-only  With --scene: don't export models, only (re)write the scene files from existing OBJs\n  \
 --size-map           Write a rough zone-shape image from manifest file sizes (needs <world>; no export)\n  \
 --size-type <n>      File type (low 5 bits of Unk1) to use for --size-map (default: 0x15, cell placement files)\n  \
 --size-scale <n>     Pixels per cell in the --size-map image (default: 16)\n  \
@@ -192,6 +201,10 @@ fn parse_args() -> Args {
     let mut size_scale: u32 = 16;
     let mut model_fis: Vec<u32> = Vec::new();
     let mut noesis = NOESIS.to_string();
+    let mut scene: Vec<String> = Vec::new();
+    let mut cell_size: f64 = 250.0;
+    let mut scene_name: Option<String> = None;
+    let mut scene_script_only = false;
 
     let mut i = 0;
     while i < raw.len() {
@@ -240,6 +253,23 @@ fn parse_args() -> Args {
                     model_fis.push(parse_int_arg(part));
                 }
             }
+            "--scene" => {
+                i += 1;
+                let val = raw.get(i).expect("--scene needs a path");
+                for part in val.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    scene.push(part.to_string());
+                }
+            }
+            "--cell-size" => {
+                i += 1;
+                cell_size = raw.get(i).expect("--cell-size needs a value").trim().parse::<f64>()
+                    .unwrap_or_else(|_| panic!("invalid --cell-size"));
+            }
+            "--scene-name" => {
+                i += 1;
+                scene_name = Some(raw.get(i).cloned().expect("--scene-name needs a value"));
+            }
+            "--scene-script-only" => scene_script_only = true,
             "--size-type" => {
                 i += 1;
                 size_type = Some(parse_int_arg(raw.get(i).expect("--size-type needs a value")));
@@ -259,7 +289,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    let world = if !model_fis.is_empty() || list_worlds || world_lut || model_list || creature_list || item_list {
+    let world = if !model_fis.is_empty() || !scene.is_empty() || list_worlds || world_lut || model_list || creature_list || item_list {
         0
     } else {
         let world_str: &String = match positional.len() {
@@ -297,6 +327,10 @@ fn parse_args() -> Args {
         size_scale,
         model_fis,
         noesis,
+        scene,
+        cell_size,
+        scene_name,
+        scene_script_only,
     }
 }
 
@@ -376,6 +410,38 @@ fn main() {
         return;
     }
 
+    if !args.scene.is_empty() {
+        let models_dir = Path::new(FINAL_EXPORT_DIR).join("models");
+        let scenes_dir = Path::new(FINAL_EXPORT_DIR).join("scenes");
+        let opts = model_export::Options {
+            manifest: &args.manifest,
+            exe: &args.exe,
+            mnf: &args.mnf,
+            temp_dir: &args.out,
+            out_root: &models_dir,
+            dry_run: args.dry_run,
+            skip_export: args.skip_export,
+            keep_temp: args.no_cleanup,
+            noesis: &args.noesis,
+        };
+        let sa = scene_export::SceneArgs {
+            inputs: &args.scene,
+            cell_size: args.cell_size,
+            name: args.scene_name.as_deref(),
+            script_only: args.scene_script_only,
+            scenes_dir: &scenes_dir,
+        };
+        match scene_export::run(&sa, &opts) {
+            Ok(p) => {
+                if !args.dry_run {
+                    println!("\nFinished. In Blender: Scripting tab -> Open -> {} -> Run Script.", p.display());
+                }
+            }
+            Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+        }
+        return;
+    }
+
     if !args.model_fis.is_empty() {
         let models_dir = Path::new(FINAL_EXPORT_DIR).join("models");
         let opts = model_export::Options {
@@ -391,15 +457,10 @@ fn main() {
         };
         let total = args.model_fis.len();
         let mut failed = 0usize;
-        for (n, fi) in args.model_fis.iter().enumerate() {
-            if total > 1 {
-                println!("\n=== Model {}/{}: 0x{:x} ===", n + 1, total, fi);
-            }
-            match model_export::run(*fi, &opts) {
-                Ok(s) => println!(
-                    "\nFinished. {} texture(s) exported, {} missing -> {}",
-                    s.textures_found, s.textures_missing, s.out_dir.display()
-                ),
+        for (fi, r) in model_export::run_batch(&args.model_fis, &opts) {
+            match r {
+                Ok(s) => println!("\nFinished 0x{:x}. {} texture(s) exported, {} missing -> {}",
+                                fi, s.textures_found, s.textures_missing, s.out_dir.display()),
                 Err(e) => { eprintln!("{}", e); failed += 1; }
             }
         }

@@ -3,15 +3,10 @@ use image::{ImageBuffer, Luma};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-/// Manifest type of the per-cell placement files (see cellplacement parser).
 const CELL_PLACEMENT_TYPE: u32 = 0x15;
 
-/// Brightness given to the smallest existing file, so present-but-tiny cells
-/// stay distinguishable from missing cells (pure black).
 const MIN_BRIGHTNESS: f32 = 24.0;
 
-/// Builds a rough zone-shape image: one pixel (scaled up by `scale`) per cell,
-/// brightness = uncompressed size of the per-cell placement file (type 0x15 by default). Missing cells are black.
 pub fn run(
     manifest: &str,
     world: u32,

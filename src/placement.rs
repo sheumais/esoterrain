@@ -87,7 +87,7 @@ fn parse_rtree_header(buf: &[u8], off: usize) -> Value {
     })
 }
 
-/// Returns (node_json, next_offset). Mirrors the recursive Python parse_rtree_node.
+
 fn parse_rtree_node(buf: &[u8], off: usize) -> (Value, usize) {
     let mut o = off;
 
@@ -180,7 +180,7 @@ pub fn parse_file(path: &Path) -> io::Result<Value> {
     }))
 }
 
-/// Parses `input` and writes pretty-printed JSON to `output`.
+
 pub fn parse_and_write(input: &Path, output: &Path) -> io::Result<()> {
     let value = parse_file(input)?;
     let s = serde_json::to_string_pretty(&value)
