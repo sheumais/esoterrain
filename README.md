@@ -21,3 +21,5 @@ generate mnf with (as documented in esoextractdata readme)
 ```shell
 EsoExtractData.exe "C:\Program Files (x86)\Steam\steamapps\common\Zenimax Online\The Elder Scrolls Online\depot\eso.mnf" .\export\ -m eso_mnf.csv
 ```
+
+![Rockgrove Render](rockgrove.png)
