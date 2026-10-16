@@ -12,6 +12,8 @@ mod cell_placement;
 mod sizemap;
 mod model_export;
 mod scene_export;
+mod keep_export;
+mod world_models;
 
 use landfile::{fixed_channel_range, save_rgb_from_channels, LandFile, RawBigImage, RawTile};
 use manifest::filter_manifest;
@@ -27,6 +29,7 @@ use crate::manifest::filter_colourmap_manifest;
 const DEFAULT_EXE: &str = "C:/Users/H/Documents/EsoExtractData v0.53/EsoExtractData.exe";
 const DEFAULT_OUT: &str = "./temp"; // WILL GET DELETED AFTER
 const FINAL_EXPORT_DIR: &str = "./export";
+const LUT_DIR: &str = "./luts"; // all *_lut.csv files; per-world model LUTs go in LUT_DIR/worlds/
 const MNF_EXPORT: &str = "eso_mnf.csv"; // can't upload to github due to file size limits.
 const RAW_MNF: &str = "C:/Program Files (x86)/Steam/steamapps/common/Zenimax Online/The Elder Scrolls Online/depot/eso.mnf";
 const NOESIS: &str = "C:/Users/H/Documents/EsoExtractData v0.53/noesisv4474/Noesis64.exe";
@@ -57,6 +60,15 @@ struct Args {
     cell_size: f64,
     scene_name: Option<String>,
     scene_script_only: bool,
+    scene_grid: bool,
+    keeps: bool,
+    keep_key: Option<u32>,
+    alliance: Option<String>,
+    no_auto_variants: bool,
+    world_model_lut: bool,
+    lut_worlds: Vec<u32>,
+    lut_rot: bool,
+    all_luts: bool,
 }
 
 fn parse_int_arg(s: &str) -> u32 {
@@ -158,21 +170,29 @@ Options:\n  \
 --dry-run            Show what would happen without exporting/deleting\n  \
 --skip-export        Skip calling the exporter; assume files are already on disk\n  \
 --no-cleanup         Keep every file the archive export dumped\n  \
+--no-auto-variants  Don't split overlapping meshes (alternative versions) into separate OBJs; by default every\n                       model with such meshes is exported once per version (<index>_<mesh>.obj)\n  \
 --model <FileIndex>  Export a model + textures + .obj/.mtl into export/models/ (one flat folder).\n                       Repeat the flag or use commas for several: --model 0x15b253,0x15b254\n  \
 --noesis <path>      Path to Noesis64.exe (default: {})\n  \
 --scene <paths>      Export every model used by placement JSON file(s) or folder(s) (comma-separated or repeated;\n                       world placement.json and cell_x#_z#.json both work), then write a Blender script that\n                       places them as collection-instance references into export/scenes/\n  \
 --cell-size <n>      World units per cell for cell_x#_z# files (default 250; 0 = don't offset)\n  \
 --scene-name <name>  Output name for the scene .py/.json (default: derived from the world_0x.. folder)\n  \
 --scene-script-only  With --scene: don't export models, only (re)write the scene files from existing OBJs\n  \
+--scene-grid         With --scene: write <name>_grid.py instead of the placed scene: every model once, in a grid, with all of its\n                       versions stacked vertically in its cell\n  \
+--alliance <name>    With --scene: which version of a multi-version model starts visible, e.g. daggerfall, ebonheart, aldmeri\n                       (default: the first one). The other versions stay hidden in the same spot; unhide one in Blender to switch.\n  \
 --size-map           Write a rough zone-shape image from manifest file sizes (needs <world>; no export)\n  \
 --size-type <n>      File type (low 5 bits of Unk1) to use for --size-map (default: 0x15, cell placement files)\n  \
 --size-scale <n>     Pixels per cell in the --size-map image (default: 16)\n  \
 --placement-only     Only export/parse the placement (instance) file for this world; skip terrain/colourmap entirely\n  \
 --list-worlds        List every world found in the manifest with terrain cell data, and its grid size (no export/world arg needed)\n \
---world-lut          Export the world table and write export/worlds_lut.csv\n \
---model-lut          Export the models table and write export/models_lut.csv\n \
---creature-lut       Export the creatures table, creature models and creature textures table and write export/creatures_lut.csv\n \
---item-lut           Export the item visual templates (0x58), part materials (0x50), materials (0x05) and item names (0x171) tables and write export/items_lut.csv\n \
+--world-lut          Export the world table and write luts/worlds_lut.csv\n \
+--model-lut          Export the models table and write luts/models_lut.csv\n \
+--creature-lut       Export the creatures table, creature models and creature textures table and write luts/creatures_lut.csv\n \
+--item-lut           Export the item visual templates (0x58), part materials (0x50), materials (0x05) and item names (0x171) tables and write luts/items_lut.csv\n \
+--world-model-lut    For EVERY world: export its placement files and write luts/worlds/world_0x<id>.csv\n  \
+                       (model_id,x,y,z; sorted; from the world placement file only). Each archive is exported once.\n \
+--worlds <list>      With --world-model-lut: only these worlds (comma-separated, hex or decimal)\n \
+--with-rot           With --world-model-lut: also write rx,ry,rz columns\n \
+--all-luts           Write every LUT (run once per patch): the world, model, creature and item LUTs share one archive export, then\n                       --world-model-lut runs. --exe/--mnf/--manifest/--out/--worlds/--with-rot/--dry-run/--no-cleanup apply\n \
 --
 ",
         MNF_EXPORT, RAW_MNF, DEFAULT_EXE, DEFAULT_OUT, NOESIS
@@ -205,6 +225,15 @@ fn parse_args() -> Args {
     let mut cell_size: f64 = 250.0;
     let mut scene_name: Option<String> = None;
     let mut scene_script_only = false;
+    let mut scene_grid = false;
+    let mut keeps = false;
+    let mut keep_key = None;
+    let mut alliance: Option<String> = None;
+    let mut no_auto_variants = false;
+    let mut world_model_lut = false;
+    let mut lut_worlds: Vec<u32> = Vec::new();
+    let mut lut_rot = false;
+    let mut all_luts = false;
 
     let mut i = 0;
     while i < raw.len() {
@@ -233,6 +262,7 @@ fn parse_args() -> Args {
             "--dry-run" => dry_run = true,
             "--skip-export" => skip_export = true,
             "--no-cleanup" => no_cleanup = true,
+            "--no-auto-variants" => no_auto_variants = true,
             "--placement-only" => placement_only = true,
             "--list-worlds" => list_worlds = true,
             "--world-lut" => world_lut = true,
@@ -240,6 +270,16 @@ fn parse_args() -> Args {
             "--creature-lut" => creature_list = true,
             "--item-lut" => item_list = true,
             "--size-map" => size_map = true,
+            "--world-model-lut" => world_model_lut = true,
+            "--with-rot" => lut_rot = true,
+            "--all-luts" => all_luts = true,
+            "--worlds" => {
+                i += 1;
+                let val = raw.get(i).expect("--worlds needs a value");
+                for part in val.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    lut_worlds.push(parse_int_arg(part));
+                }
+            }
 
 
             "--noesis" => {
@@ -270,6 +310,11 @@ fn parse_args() -> Args {
                 scene_name = Some(raw.get(i).cloned().expect("--scene-name needs a value"));
             }
             "--scene-script-only" => scene_script_only = true,
+            "--scene-grid" => scene_grid = true,
+            "--alliance" => {
+                i += 1;
+                alliance = Some(raw.get(i).cloned().expect("--alliance needs a value"));
+            }
             "--size-type" => {
                 i += 1;
                 size_type = Some(parse_int_arg(raw.get(i).expect("--size-type needs a value")));
@@ -277,6 +322,11 @@ fn parse_args() -> Args {
             "--size-scale" => {
                 i += 1;
                 size_scale = parse_int_arg(raw.get(i).expect("--size-scale needs a value"));
+            }
+            "--keeps" => keeps = true,
+            "--keep-key" => {
+                i += 1;
+                keep_key = Some(parse_int_arg(raw.get(i).expect("--keep-key needs a value")));
             }
 
 
@@ -289,7 +339,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    let world = if !model_fis.is_empty() || !scene.is_empty() || list_worlds || world_lut || model_list || creature_list || item_list {
+    let world = if !model_fis.is_empty() || !scene.is_empty() || list_worlds || world_lut || model_list || creature_list || item_list || keeps || world_model_lut || all_luts {
         0
     } else {
         let world_str: &String = match positional.len() {
@@ -331,7 +381,184 @@ fn parse_args() -> Args {
         cell_size,
         scene_name,
         scene_script_only,
+        scene_grid,
+        keeps,
+        keep_key,
+        alliance,
+        no_auto_variants,
+        world_model_lut,
+        lut_worlds,
+        lut_rot,
+        all_luts,
     }
+}
+
+fn find_uncompressed(dir: &str, index: u32) -> Option<std::path::PathBuf> {
+    let want = format!("{}_Uncompressed", index);
+    WalkDir::new(dir).into_iter().filter_map(Result::ok).map(|e| e.into_path())
+        .find(|p| p.is_file() && p.file_stem().and_then(|s| s.to_str()) == Some(want.as_str()))
+}
+
+fn find_lang(dir: &str) -> Option<std::path::PathBuf> {
+    WalkDir::new(dir).into_iter().filter_map(Result::ok).map(|e| e.into_path())
+        .find(|p| p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some("en.lang.csv"))
+}
+
+fn build_world_lut(m: &manifest::TableMatch, dir: &str) -> Result<(), String> {
+    let entry = find_uncompressed(dir, m.index)
+        .ok_or_else(|| format!("Uncompressed World LUT file '{}_Uncompressed.*' not found under '{}'.", m.index, dir))?;
+    println!("Parsing file: {}", entry.display());
+    std::fs::create_dir_all(LUT_DIR).map_err(|e| format!("failed to create luts dir: {}", e))?;
+    let out_path = Path::new(LUT_DIR).join("worlds_lut.csv");
+
+    let zone_names = match find_lang(dir) {
+        Some(p) => match worldlut::load_zone_names(&p) {
+            Ok(n) => { println!("Loaded {} zone names from {}", n.len(), p.display()); n }
+            Err(e) => { eprintln!("Failed to read '{}': {}", p.display(), e); Default::default() }
+        },
+        None => {
+            eprintln!("Warning: en.lang.csv not found under '{}'; zone_name will be empty.", dir);
+            Default::default()
+        }
+    };
+    let n = worldlut::parse_and_write(&entry, &zone_names, &out_path)
+        .map_err(|e| format!("Error parsing '{}': {}", entry.display(), e))?;
+    println!("Wrote {} worlds -> {}", n, out_path.display());
+    Ok(())
+}
+
+fn build_model_lut(m: &manifest::TableMatch, dir: &str) -> Result<(), String> {
+    let entry = find_uncompressed(dir, m.index)
+        .ok_or_else(|| format!("Model list file for index {}_Uncompressed not found under '{}'.", m.index, dir))?;
+    let names = find_lang(dir)
+        .and_then(|p| worldlut::load_lang_group(&p, model::MODEL_NAME_GROUP).ok())
+        .unwrap_or_default();
+    std::fs::create_dir_all(LUT_DIR).map_err(|e| format!("failed to create luts dir: {}", e))?;
+    let out_path = Path::new(LUT_DIR).join("models_lut.csv");
+    let n = model::parse_and_write(&entry, &names, &out_path)
+        .map_err(|e| format!("Error parsing '{}': {}", entry.display(), e))?;
+    println!("Wrote {} models -> {}", n, out_path.display());
+    Ok(())
+}
+
+fn load_table(m: &manifest::TableMatch, label: &str, dir: &str) -> Result<creature::Table, String> {
+    let p = find_uncompressed(dir, m.index)
+        .ok_or_else(|| format!("{} file '{}_Uncompressed' not found under '{}'.", label, m.index, dir))?;
+    creature::Table::load(&p).map_err(|e| e.to_string())
+}
+
+/// `found` = [textures, links, models, creatures]
+fn build_creature_lut(found: &[manifest::TableMatch], dir: &str) -> Result<(), String> {
+    let textures = load_table(&found[0], "Texture", dir)?;
+    let links = load_table(&found[1], "Link", dir)?;
+    let models = load_table(&found[2], "Model", dir)?;
+    let creature_tbl = load_table(&found[3], "Creature", dir)?;
+    let names = find_lang(dir)
+        .and_then(|p| worldlut::load_lang_group(&p, creature::CREATURE_NAME_GROUP).ok())
+        .unwrap_or_default();
+    println!("Loaded {} creature names.", names.len());
+    std::fs::create_dir_all(LUT_DIR).map_err(|e| format!("failed to create luts dir: {}", e))?;
+    let out_path = Path::new(LUT_DIR).join("creatures_lut.csv");
+    let n = creature::build_csv(&textures, &links, &models, &creature_tbl, &names, &out_path)
+        .map_err(|e| format!("Error writing '{}': {}", out_path.display(), e))?;
+    println!("Wrote {} creatures -> {}", n, out_path.display());
+    Ok(())
+}
+
+/// `found` = [materials, part materials, item visual templates, item names]
+fn build_item_lut(found: &[manifest::TableMatch], dir: &str) -> Result<(), String> {
+    let materials = load_table(&found[0], "Material", dir)?;
+    let part_mats = load_table(&found[1], "Part material", dir)?;
+    let templates = load_table(&found[2], "Item visual template", dir)?;
+    let name_tbl = load_table(&found[3], "Item name", dir)?;
+    let names = find_lang(dir)
+        .and_then(|p| worldlut::load_lang_group(&p, items::ITEM_NAME_GROUP).ok())
+        .unwrap_or_default();
+    println!("Loaded {} item names.", names.len());
+    std::fs::create_dir_all(LUT_DIR).map_err(|e| format!("failed to create luts dir: {}", e))?;
+    let out_path = Path::new(LUT_DIR).join("items_lut.csv");
+    let n = items::build_csv(&templates, &part_mats, &materials, &name_tbl, &names, &out_path)
+        .map_err(|e| format!("Error writing '{}': {}", out_path.display(), e))?;
+    println!("Wrote {} item parts -> {}", n, out_path.display());
+    Ok(())
+}
+
+fn table_match(args: &Args, fi: u32, label: &str) -> Result<manifest::TableMatch, String> {
+    match manifest::filter_table_manifest(&args.manifest, fi) {
+        Ok(Some(m)) => { println!("{}: index {} (arch {})", label, m.index, m.arch); Ok(m) }
+        Ok(None) => Err(format!("{} (file_index 0x{:x}) not found in manifest.", label, fi)),
+        Err(e) => Err(format!("Failed to read manifest '{}': {}", args.manifest, e)),
+    }
+}
+
+/// World, model, creature and item LUTs share their archive(s): export it once, then build all four.
+fn run_core_luts(args: &Args) -> Result<(), String> {
+    let world = table_match(args, manifest::WORLD_LUT_FILE_INDEX, "world table")?;
+    let model_m = table_match(args, manifest::MODEL_LIST_FILE_INDEX, "model list")?;
+    let mut creature_set = Vec::new();
+    for (fi, label) in [(0x05u32, "textures"), (0x06, "links"), (0x07, "models"), (0x08, "creatures")] {
+        creature_set.push(table_match(args, fi, label)?);
+    }
+    let mut item_set = Vec::new();
+    for (fi, label) in [
+        (items::MATERIAL_DEF, "materials"),
+        (items::ITEM_PART_MATERIAL_DEF, "part materials"),
+        (items::ITEM_VISUAL_TEMPLATE_DEF, "item visual templates"),
+        (items::ITEM_NAME_TABLE_DEF, "item names"),
+    ] {
+        item_set.push(table_match(args, fi, label)?);
+    }
+
+    let all: Vec<&manifest::TableMatch> = std::iter::once(&world)
+        .chain(std::iter::once(&model_m))
+        .chain(creature_set.iter())
+        .chain(item_set.iter())
+        .collect();
+    let mut archs: Vec<u32> = all.iter().map(|m| m.arch).collect();
+    archs.sort_unstable();
+    archs.dedup();
+    let wanted: HashSet<u32> = all.iter().map(|m| m.index).collect();
+
+    if !args.skip_export {
+        for a in &archs {
+            println!("\nExporting archive {} (shared by all tables)...", a);
+            if !export::export_archive_combined(&args.exe, &args.mnf, &args.out, *a, args.dry_run) {
+                eprintln!("Archive export reported an error; check output above before continuing.");
+            }
+        }
+        if !args.no_cleanup {
+            let (kept, removed) = export::cleanup_export_dir_keeping(&args.out, &wanted, &["en.lang.csv"], args.dry_run);
+            println!("Kept {} files, removed {} files.", kept, removed);
+        }
+    }
+    if args.dry_run { println!("\nDry run complete."); return Ok(()); }
+
+    let mut errors: Vec<String> = Vec::new();
+    println!();
+    if let Err(e) = build_world_lut(&world, &args.out) { errors.push(e); }
+    if let Err(e) = build_model_lut(&model_m, &args.out) { errors.push(e); }
+    if let Err(e) = build_creature_lut(&creature_set, &args.out) { errors.push(e); }
+    if let Err(e) = build_item_lut(&item_set, &args.out) { errors.push(e); }
+
+    if !args.no_cleanup { let _ = std::fs::remove_dir_all(&args.out); }
+    if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) }
+}
+
+fn run_world_model_lut(args: &Args) -> Result<(), String> {
+    let out_dir = Path::new(LUT_DIR).join("worlds");
+    let a = world_models::RunArgs {
+        manifest: &args.manifest,
+        exe: &args.exe,
+        mnf: &args.mnf,
+        temp_dir: &args.out,
+        out_dir: &out_dir,
+        only_worlds: &args.lut_worlds,
+        with_rot: args.lut_rot,
+        dry_run: args.dry_run,
+        skip_export: args.skip_export,
+        keep_temp: args.no_cleanup,
+    };
+    world_models::run(&a)
 }
 
 const ANSI_RED: &str = "\x1b[31m";
@@ -339,6 +566,7 @@ const ANSI_RESET: &str = "\x1b[0m";
 
 fn main() {
     let args = parse_args();
+    model_export::set_auto_variants(!args.no_auto_variants);
 
     if args.list_worlds {
         println!("Scanning manifest '{}' for worlds with terrain cell data...", args.manifest);
@@ -355,7 +583,7 @@ fn main() {
             return;
         }
 
-        let lut = match worldlut::load_lut_csv(Path::new("export/worlds_lut.csv")) {
+        let lut = match worldlut::load_lut_csv(&Path::new(LUT_DIR).join("worlds_lut.csv")) {
             Ok(m) => m,
             Err(_) => {
                 HashMap::new()
@@ -410,6 +638,29 @@ fn main() {
         return;
     }
 
+    if args.all_luts {
+        if args.skip_export {
+            eprintln!("--all-luts can't be combined with --skip-export (the LUTs export their own tables).");
+            std::process::exit(1);
+        }
+        let mut failed: Vec<&str> = Vec::new();
+        println!("===== [1/2] world, model, creature and item LUTs (one export) =====");
+        if let Err(e) = run_core_luts(&args) { eprintln!("{}", e); failed.push("world/model/creature/item LUTs"); }
+        println!("\n===== [2/2] per-world model LUTs =====");
+        if let Err(e) = run_world_model_lut(&args) { eprintln!("{}", e); failed.push("per-world model LUTs"); }
+        if failed.is_empty() {
+            println!("\nAll LUTs written to {}.", LUT_DIR);
+            return;
+        }
+        eprintln!("\nFailed: {}", failed.join(", "));
+        std::process::exit(1);
+    }
+
+    if args.world_model_lut {
+        if let Err(e) = run_world_model_lut(&args) { eprintln!("{}", e); std::process::exit(1); }
+        return;
+    }
+
     if !args.scene.is_empty() {
         let models_dir = Path::new(FINAL_EXPORT_DIR).join("models");
         let scenes_dir = Path::new(FINAL_EXPORT_DIR).join("scenes");
@@ -430,6 +681,8 @@ fn main() {
             name: args.scene_name.as_deref(),
             script_only: args.scene_script_only,
             scenes_dir: &scenes_dir,
+            alliance: args.alliance.as_deref(),
+            grid: args.scene_grid,
         };
         match scene_export::run(&sa, &opts) {
             Ok(p) => {
@@ -585,49 +838,7 @@ fn main() {
         }
         if args.dry_run { println!("\nDry run complete."); return; }
 
-        let wanted_name = format!("{}_Uncompressed", m.index);
-        let found = WalkDir::new(&args.out)
-            .into_iter()
-            .filter_map(Result::ok)
-            .find(|e| {
-                e.path().is_file()
-                    && e.path()
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .map_or(false, |s| s == wanted_name)
-            });
-        let Some(entry) = found else {
-            eprintln!(
-                "Uncompressed World LUT file '{}.*' not found under '{}'.",
-                wanted_name, args.out
-            );
-            std::process::exit(1);
-        };
-        println!("Parsing file: {}", entry.path().display());
-    
-        std::fs::create_dir_all(FINAL_EXPORT_DIR).expect("failed to create export dir");
-        let out_path = Path::new(FINAL_EXPORT_DIR).join("worlds_lut.csv");
-        let lang_path = WalkDir::new(&args.out)
-            .into_iter()
-            .filter_map(Result::ok)
-            .map(|e| e.into_path())
-            .find(|p| p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some("en.lang.csv"));
-
-        let zone_names = match &lang_path {
-            Some(p) => match worldlut::load_zone_names(p) {
-                Ok(n) => { println!("Loaded {} zone names from {}", n.len(), p.display()); n }
-                Err(e) => { eprintln!("Failed to read '{}': {}", p.display(), e); Default::default() }
-            },
-            None => {
-                eprintln!("Warning: en.lang.csv not found under '{}'; zone_name will be empty.", args.out);
-                Default::default()
-            }
-        };
-
-        match worldlut::parse_and_write(entry.path(), &zone_names, &out_path) {
-            Ok(n) => println!("Wrote {} worlds -> {}", n, out_path.display()),
-            Err(e) => { eprintln!("Error parsing '{}': {}", entry.path().display(), e); std::process::exit(1); }
-        }
+        if let Err(e) = build_world_lut(&m, &args.out) { eprintln!("{}", e); std::process::exit(1); }
 
         if !args.no_cleanup {
             let _ = std::fs::remove_dir_all(&args.out);
@@ -658,36 +869,62 @@ fn main() {
         }
         if args.dry_run { println!("\nDry run complete."); return; }
 
-        let wanted_name = format!("{}_Uncompressed", m.index);
-        let found = WalkDir::new(&args.out).into_iter().filter_map(Result::ok).find(|e| {
-            e.path().is_file()
-                && e.path().file_stem().and_then(|s| s.to_str()).map_or(false, |s| s == wanted_name)
-        });
-        let Some(entry) = found else {
-            eprintln!("Model list file for index {} not found under '{}'.", wanted_name, args.out);
-            std::process::exit(1);
-        };
-
-        let names = WalkDir::new(&args.out).into_iter().filter_map(Result::ok)
-            .map(|e| e.into_path())
-            .find(|p| p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some("en.lang.csv"))
-            .and_then(|p| worldlut::load_lang_group(&p, model::MODEL_NAME_GROUP).ok())
-            .unwrap_or_default();
-
-        std::fs::create_dir_all(FINAL_EXPORT_DIR).expect("failed to create export dir");
-        let out_path = Path::new(FINAL_EXPORT_DIR).join("models_lut.csv");
-        match model::parse_and_write(entry.path(), &names, &out_path) {
-            Ok(n) => println!("Wrote {} models -> {}", n, out_path.display()),
-            Err(e) => { eprintln!("Error parsing '{}': {}", entry.path().display(), e); std::process::exit(1); }
-        }
+        if let Err(e) = build_model_lut(&m, &args.out) { eprintln!("{}", e); std::process::exit(1); }
         if !args.no_cleanup { let _ = std::fs::remove_dir_all(&args.out); }
         return;
     }
 
-    fn find_uncompressed(dir: &str, index: u32) -> Option<std::path::PathBuf> {
-        let want = format!("{}_Uncompressed", index);
-        WalkDir::new(dir).into_iter().filter_map(Result::ok).map(|e| e.into_path())
-            .find(|p| p.is_file() && p.file_stem().and_then(|s| s.to_str()) == Some(want.as_str()))
+    if args.keeps {
+        let mut found = Vec::new();
+        for (fi, label) in [
+            (keep_export::KEEPS_FILE_INDEX, "keeps"),
+            (keep_export::PIECES_FILE_INDEX, "keep pieces"),
+        ] {
+            match manifest::filter_table_manifest(&args.manifest, fi) {
+                Ok(Some(m)) => { println!("{}: index {} (arch {})", label, m.index, m.arch); found.push(m); }
+                Ok(None) => { eprintln!("{} (file_index 0x{:x}) not found in manifest.", label, fi); std::process::exit(1); }
+                Err(e) => { eprintln!("Failed to read manifest '{}': {}", args.manifest, e); std::process::exit(1); }
+            }
+        }
+        let mut archs: Vec<u32> = found.iter().map(|m| m.arch).collect();
+        archs.sort_unstable(); archs.dedup();
+
+        if !args.skip_export {
+            for a in &archs {
+                println!("\nExporting archive {}...", a);
+                if !export::export_archive_combined(&args.exe, &args.mnf, &args.out, *a, args.dry_run) {
+                    eprintln!("Archive export reported an error; check output above before continuing.");
+                }
+            }
+            if !args.no_cleanup {
+                let wanted: HashSet<u32> = found.iter().map(|m| m.index).collect();
+                let (kept, removed) = export::cleanup_export_dir_keeping(&args.out, &wanted, &[], args.dry_run);
+                println!("Kept {} files, removed {} files.", kept, removed);
+            }
+        }
+        if args.dry_run { println!("\nDry run complete."); return; }
+
+        let locate = |m: &manifest::TableMatch, label: &str| -> std::path::PathBuf {
+            find_uncompressed(&args.out, m.index).unwrap_or_else(|| {
+                eprintln!("{} file '{}_Uncompressed' not found under '{}'.", label, m.index, args.out);
+                std::process::exit(1);
+            })
+        };
+        let keeps_path = locate(&found[0], "Keeps");
+        let pieces_path = locate(&found[1], "Keep pieces");
+
+        let a = keep_export::KeepArgs {
+            keeps_file: &keeps_path,
+            pieces_file: &pieces_path,
+            cell_m: 3.0,
+            units_per_metre: 100.0,
+            only_key: args.keep_key,
+            out_file: Path::new("export/keeps_placement.json"),
+        };
+        if let Err(e) = keep_export::run(&a) { eprintln!("{}", e); std::process::exit(1); }
+
+        if !args.no_cleanup { let _ = std::fs::remove_dir_all(&args.out); }
+        return;
     }
 
     if args.creature_list {
@@ -717,30 +954,7 @@ fn main() {
         }
         if args.dry_run { println!("\nDry run complete."); return; }
 
-        let load = |m: &manifest::TableMatch, label: &str| -> creature::Table {
-            let Some(p) = find_uncompressed(&args.out, m.index) else {
-                eprintln!("{} file '{}_Uncompressed' not found under '{}'.", label, m.index, args.out);
-                std::process::exit(1);
-            };
-            creature::Table::load(&p).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); })
-        };
-        let (textures, links, models, creature_tbl) = (
-            load(&found[0], "Texture"), load(&found[1], "Link"),
-            load(&found[2], "Model"), load(&found[3], "Creature"),
-        );
-
-        let names = WalkDir::new(&args.out).into_iter().filter_map(Result::ok).map(|e| e.into_path())
-            .find(|p| p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some("en.lang.csv"))
-            .and_then(|p| worldlut::load_lang_group(&p, creature::CREATURE_NAME_GROUP).ok())
-            .unwrap_or_default();
-        println!("Loaded {} creature names.", names.len());
-
-        std::fs::create_dir_all(FINAL_EXPORT_DIR).expect("failed to create export dir");
-        let out_path = Path::new(FINAL_EXPORT_DIR).join("creatures_lut.csv");
-        match creature::build_csv(&textures, &links, &models, &creature_tbl, &names, &out_path) {
-            Ok(n) => println!("Wrote {} creatures -> {}", n, out_path.display()),
-            Err(e) => { eprintln!("Error writing '{}': {}", out_path.display(), e); std::process::exit(1); }
-        }
+        if let Err(e) = build_creature_lut(&found, &args.out) { eprintln!("{}", e); std::process::exit(1); }
         if !args.no_cleanup { let _ = std::fs::remove_dir_all(&args.out); }
         return;
     }
@@ -776,30 +990,7 @@ fn main() {
         }
         if args.dry_run { println!("\nDry run complete."); return; }
 
-        let load = |m: &manifest::TableMatch, label: &str| -> creature::Table {
-            let Some(p) = find_uncompressed(&args.out, m.index) else {
-                eprintln!("{} file '{}_Uncompressed' not found under '{}'.", label, m.index, args.out);
-                std::process::exit(1);
-            };
-            creature::Table::load(&p).unwrap_or_else(|e| { eprintln!("{}", e); std::process::exit(1); })
-        };
-        let (materials, part_mats, templates, name_tbl) = (
-            load(&found[0], "Material"), load(&found[1], "Part material"),
-            load(&found[2], "Item visual template"), load(&found[3], "Item name"),
-        );
-
-        let names = WalkDir::new(&args.out).into_iter().filter_map(Result::ok).map(|e| e.into_path())
-            .find(|p| p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some("en.lang.csv"))
-            .and_then(|p| worldlut::load_lang_group(&p, items::ITEM_NAME_GROUP).ok())
-            .unwrap_or_default();
-        println!("Loaded {} item names.", names.len());
-
-        std::fs::create_dir_all(FINAL_EXPORT_DIR).expect("failed to create export dir");
-        let out_path = Path::new(FINAL_EXPORT_DIR).join("items_lut.csv");
-        match items::build_csv(&templates, &part_mats, &materials, &name_tbl, &names, &out_path) {
-            Ok(n) => println!("Wrote {} item parts -> {}", n, out_path.display()),
-            Err(e) => { eprintln!("Error writing '{}': {}", out_path.display(), e); std::process::exit(1); }
-        }
+        if let Err(e) = build_item_lut(&found, &args.out) { eprintln!("{}", e); std::process::exit(1); }
         if !args.no_cleanup { let _ = std::fs::remove_dir_all(&args.out); }
         return;
     }

@@ -169,3 +169,39 @@ pub fn cleanup_export_dir_keeping(
 
     (kept, removed)
 }
+
+pub fn export_file(exe_path: &str, mnf_path: &str, out_dir: &str, arch: u32, file_index: u32, dry_run: bool) -> bool {
+    println!("Running: {} {} {} -f {}", exe_path, mnf_path, out_dir, file_index);
+    if dry_run {
+        println!("  (dry run, not executing)");
+        return true;
+    }
+
+    if let Err(e) = std::fs::create_dir_all(out_dir) {
+        eprintln!("  Failed to create output directory '{}': {}", out_dir, e);
+        return false;
+    }
+
+    match Command::new(exe_path)
+        .arg(mnf_path)
+        .arg(out_dir)
+        .arg("-f")
+        .arg(file_index.to_string())
+        .output()
+    {
+        Ok(output) => {
+            if !output.status.success() {
+                eprintln!("  Warning: file export exited with status {:?}", output.status.code());
+                if !output.stderr.is_empty() {
+                    eprintln!("{}", String::from_utf8_lossy(&output.stderr));
+                }
+                return false;
+            }
+            true
+        }
+        Err(e) => {
+            eprintln!("  Failed to launch exporter '{}': {}", exe_path, e);
+            false
+        }
+    }
+}

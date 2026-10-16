@@ -5,7 +5,14 @@
 //!   2. Export every distinct model (`model_type_id` == MNF FileIndex) through `model_export::run_batch`
 //!      (each needed archive is dumped once, not one `-f` call per file), skipping models whose
 //!      `<index>.obj` is already in the models folder.
-//!   3. Write `<name>.json` (compact instance list) and `<name>.py` (Blender import script).
+//!   3. Write `<name>.json` (compact data) and `<name>.py` (Blender import script).
+//!      Models can exist in several versions (see `model_export`: alliance banner/shield sets and automatically
+//!      detected overlapping meshes, exported as `<index>_<label>.obj`).
+//!      * Normal scene: a placement of a multi-version model becomes a collection holding one instance per
+//!        version, all in the same spot. Only the first version (or the `--alliance` one) is visible; you pick the
+//!        right one per piece in Blender by hiding/unhiding.
+//!      * Grid scene (`--scene-grid`, `<name>_grid.py`): every model once in a grid cell, all its versions stacked
+//!        vertically in that cell, for looking at everything at a glance.
 //!
 //! In Blender the script imports each unique OBJ once into its own hidden collection and then
 //! creates one *collection-instance empty* per placement. Edit a model once and every instance
@@ -106,9 +113,40 @@ pub struct SceneArgs<'a> {
     pub name: Option<&'a str>,
     pub script_only: bool,
     pub scenes_dir: &'a Path,
+    /// Which version of a multi-version model starts visible (a label such as "daggerfall" or a mesh name).
+    /// None / "all" = the first version of each model.
+    pub alliance: Option<&'a str>,
+    /// Write a viewing grid of every model (all versions stacked vertically in one cell) instead of a placed scene.
+    pub grid: bool,
+}
+
+/// One OBJ of a model: (label, file name).
+type Version = (String, String);
+
+/// The versions to use for a model. If any labelled OBJ exists those are the versions (a leftover combined
+/// `<index>.obj` from an older export is ignored); otherwise the plain OBJ is the single version.
+fn versions_of(files: &[(Option<&'static str>, String)]) -> Vec<Version> {
+    let mut v: Vec<Version> = files
+        .iter()
+        .filter_map(|(l, f)| (*l).map(|l| (l.to_string(), f.clone())))
+        .collect();
+    if v.is_empty() {
+        v = files.iter().take(1).map(|(_, f)| ("default".to_string(), f.clone())).collect();
+    }
+    v
+}
+
+fn versions_json(v: &[Version]) -> Value {
+    Value::Array(v.iter().map(|(l, f)| json!([l, f])).collect())
 }
 
 pub fn run(a: &SceneArgs, mo: &Options) -> Result<PathBuf, String> {
+    let default_label: Option<&str> = match a.alliance.map(str::trim) {
+        None | Some("") => None,
+        Some(x) if x.eq_ignore_ascii_case("all") => None,
+        Some(x) => Some(x),
+    };
+
     let files = collect_json_files(a.inputs);
     if files.is_empty() {
         return Err("No placement JSON files found for --scene.".into());
@@ -124,7 +162,6 @@ pub fn run(a: &SceneArgs, mo: &Options) -> Result<PathBuf, String> {
 
     let rows = model_export::lookup_file_indexes(mo.manifest, &ids.iter().copied().collect())
         .map_err(|e| format!("Failed to read manifest '{}': {}", mo.manifest, e))?;
-    let obj_path = |index: u32| mo.out_root.join(format!("{}.obj", index));
 
     let mut index_of: HashMap<u32, u32> = HashMap::new();
     let mut not_in_manifest = 0usize;
@@ -135,7 +172,10 @@ pub fn run(a: &SceneArgs, mo: &Options) -> Result<PathBuf, String> {
         }
     }
 
-    let todo: Vec<u32> = ids.iter().copied().filter(|id| index_of.get(id).map_or(false, |i| !obj_path(*i).exists())).collect();
+    // A model counts as exported if it has a plain OBJ or per-version OBJs.
+    let todo: Vec<u32> = ids.iter().copied()
+        .filter(|id| index_of.get(id).map_or(false, |i| model_export::exported_objs(mo.out_root, *i).is_empty()))
+        .collect();
     println!("{} model(s) already exported, {} to export{}.",
         index_of.len() - todo.len(), todo.len(), if not_in_manifest > 0 { format!(", {} unknown", not_in_manifest) } else { String::new() });
 
@@ -154,32 +194,65 @@ pub fn run(a: &SceneArgs, mo: &Options) -> Result<PathBuf, String> {
         }
     }
 
-    let mut models = serde_json::Map::new();
-    for id in &ids {
-        if let Some(idx) = index_of.get(id) {
-            if obj_path(*idx).exists() {
-                models.insert(id.to_string(), Value::from(format!("{}.obj", idx)));
-            }
-        }
+    // The OBJ versions of every model that has been exported.
+    let exported: HashMap<u32, Vec<Version>> = ids.iter()
+        .filter_map(|id| {
+            let f = model_export::exported_objs(mo.out_root, *index_of.get(id)?);
+            if f.is_empty() { None } else { Some((*id, versions_of(&f))) }
+        })
+        .collect();
+    if exported.is_empty() {
+        return Err("No model has an exported OBJ; nothing to write.".to_string());
     }
-    let kept: Vec<&Inst> = insts.iter().filter(|i| models.contains_key(&i.model.to_string())).collect();
-    let dropped = insts.len() - kept.len();
-    println!("\n{} model(s) have an OBJ; {} instance(s) kept, {} dropped (model missing).", models.len(), kept.len(), dropped);
-    if kept.is_empty() {
-        return Err("No instances have an exported OBJ; nothing to write.".into());
+    let multi = exported.values().filter(|v| v.len() > 1).count();
+    println!("{} model(s) have an OBJ, {} of them in several versions.", exported.len(), multi);
+    if let Some(d) = default_label {
+        let hit = exported.values().any(|v| v.iter().any(|(l, _)| l.eq_ignore_ascii_case(d)));
+        if !hit && multi > 0 {
+            println!("No model has a version called '{}'; showing the first version of each.", d);
+        }
     }
 
     fs::create_dir_all(a.scenes_dir).map_err(|e| format!("Failed to create '{}': {}", a.scenes_dir.display(), e))?;
-    let name = a.name.map(|s| s.to_string()).unwrap_or_else(|| default_name(a.inputs));
+    let base_name = a.name.map(|s| s.to_string()).unwrap_or_else(|| default_name(a.inputs));
+    let models_abs = plain_abs(mo.out_root);
 
-    let inst_json: Vec<Value> = kept.iter().map(|i| json!([i.model, i.pos[0], i.pos[1], i.pos[2], i.rot[0], i.rot[1], i.rot[2]])).collect();
-    let sidecar = json!({ "models": Value::Object(models), "instances": inst_json });
+    let (name, template, sidecar): (String, &str, Value) = if a.grid {
+        // Grid: every model once; all of its versions stacked vertically in its cell.
+        let mut list: Vec<(u32, &Vec<Version>)> = exported.iter().map(|(k, v)| (*k, v)).collect();
+        list.sort_by_key(|(k, _)| *k);
+        let models: Vec<Value> = list.iter().map(|(id, v)| json!([id, versions_json(v)])).collect();
+        println!("\nGrid of {} model(s) ({} with several versions stacked).", models.len(), multi);
+        (format!("{}_grid", base_name), GRID_TEMPLATE, json!({ "models": models }))
+    } else {
+        // Placed scene: one entry per model, plus the instances. Multi-version models become a choice collection
+        // per placement in Blender, showing only the default version.
+        let mut models = serde_json::Map::new();
+        for (id, v) in &exported {
+            let show = default_label
+                .and_then(|d| v.iter().position(|(l, _)| l.eq_ignore_ascii_case(d)))
+                .unwrap_or(0);
+            models.insert(id.to_string(), json!({ "show": show, "versions": versions_json(v) }));
+        }
+        let kept: Vec<&Inst> = insts.iter().filter(|i| exported.contains_key(&i.model)).collect();
+        let dropped = insts.len() - kept.len();
+        println!("\n[{}] {} model(s) have an OBJ; {} instance(s) kept, {} dropped (model missing).", base_name, models.len(), kept.len(), dropped);
+        if kept.is_empty() {
+            return Err("No instances have an exported OBJ; nothing to write.".to_string());
+        }
+        let placements_with_choice = kept.iter().filter(|i| exported.get(&i.model).map_or(false, |v| v.len() > 1)).count();
+        if placements_with_choice > 0 {
+            println!("{} placement(s) have several versions: only the first is visible, pick the right one in Blender.", placements_with_choice);
+        }
+        let inst_json: Vec<Value> = kept.iter().map(|i| json!([i.model, i.pos[0], i.pos[1], i.pos[2], i.rot[0], i.rot[1], i.rot[2]])).collect();
+        (base_name.clone(), BLENDER_TEMPLATE, json!({ "models": Value::Object(models), "instances": inst_json }))
+    };
+
     let json_name = format!("{}.json", name);
     fs::write(a.scenes_dir.join(&json_name), serde_json::to_string(&sidecar).unwrap())
         .map_err(|e| format!("Failed to write scene json: {}", e))?;
 
-    let models_abs = plain_abs(mo.out_root);
-    let script = BLENDER_TEMPLATE
+    let script = template
         .replace("@NAME@", &name)
         .replace("@SIDECAR@", &serde_json::to_string(&json_name).unwrap())
         .replace("@MODELS_ABS@", &serde_json::to_string(&models_abs).unwrap())
@@ -194,6 +267,10 @@ pub fn run(a: &SceneArgs, mo: &Options) -> Result<PathBuf, String> {
 
 const BLENDER_TEMPLATE: &str = r#"# Generated by land_export --scene. Run in Blender: Scripting tab -> Open -> Run Script.
 # Imports every distinct model once, then places collection-instance empties that REFERENCE it.
+# Models that exist in several versions (alliance banners/shields, ...) get, per placement, one collection in
+# '<scene>_choices' that holds one instance empty per version, all in the same spot. Only the first (or the
+# --alliance one) is visible. To pick another version for that piece: hide the visible empty and unhide the
+# one you want (eye icon in the Outliner).
 import bpy, json, os
 from mathutils import Matrix, Euler, Vector
 
@@ -238,53 +315,213 @@ def import_obj(path):
     return [o for o in bpy.data.objects if o not in before]
 
 
-root = bpy.data.collections.new('%s_models' % SCENE_NAME)
-bpy.context.scene.collection.children.link(root)
-placed = bpy.data.collections.new('%s_instances' % SCENE_NAME)
-bpy.context.scene.collection.children.link(placed)
-
-# 1. one library collection per model
-lib = {}
-for fid, obj_name in data['models'].items():
-    path = os.path.join(MODELS_DIR, obj_name)
-    try:
-        objs = import_obj(path)
-    except Exception as e:
-        print('Import failed for', path, e)
-        continue
-    if not objs:
-        continue
-    col = bpy.data.collections.new('model_%s' % fid)
-    root.children.link(col)
-    for o in objs:
-        for c in list(o.users_collection):
-            c.objects.unlink(o)
-        col.objects.link(o)
-    lib[fid] = col
-
-# hide the library but keep it instanceable
-bpy.context.view_layer.layer_collection.children[root.name].exclude = True
-
-# 2. one empty per placement, instancing the model's collection
-insts = data['instances']
-if LIMIT > 0:
-    insts = insts[:LIMIT]
-count = 0
-for n, (fid, px, py, pz, rx, ry, rz) in enumerate(insts):
-    col = lib.get(str(fid))
-    if col is None:
-        continue
-    R = C @ Euler((rx, ry, rz), EULER_ORDER).to_matrix() @ C_INV
-    p = C @ Vector((px, py, pz))
-    m = Matrix.Translation(p * UNIT_SCALE) @ (R * UNIT_SCALE).to_4x4()
-    m[3][3] = 1.0
-    e = bpy.data.objects.new('%s_%d' % (fid, n), None)
+def make_empty(name, col, m, target):
+    e = bpy.data.objects.new(name, None)
     e.instance_type = 'COLLECTION'
     e.instance_collection = col
     e.empty_display_size = 0.01
     e.matrix_world = m
-    placed.objects.link(e)
+    target.objects.link(e)
+    return e
+
+
+root = bpy.data.collections.new('%s_models' % SCENE_NAME)
+bpy.context.scene.collection.children.link(root)
+placed = bpy.data.collections.new('%s_instances' % SCENE_NAME)
+bpy.context.scene.collection.children.link(placed)
+choices = None
+
+# 1. one library collection per model version
+lib = {}   # fid -> (index of the version to show, [(label, collection), ...])
+for fid, info in data['models'].items():
+    versions = info['versions']
+    cols = []
+    for label, obj_name in versions:
+        path = os.path.join(MODELS_DIR, obj_name)
+        try:
+            objs = import_obj(path)
+        except Exception as e:
+            print('Import failed for', path, e)
+            continue
+        if not objs:
+            continue
+        cname = 'model_%s' % fid if len(versions) == 1 else 'model_%s_%s' % (fid, label)
+        col = bpy.data.collections.new(cname)
+        root.children.link(col)
+        for o in objs:
+            for c in list(o.users_collection):
+                c.objects.unlink(o)
+            col.objects.link(o)
+        cols.append((label, col))
+    if cols:
+        lib[fid] = (min(info.get('show', 0), len(cols) - 1), cols)
+
+# hide the library but keep it instanceable
+bpy.context.view_layer.layer_collection.children[root.name].exclude = True
+
+# 2. one placement per instance
+insts = data['instances']
+if LIMIT > 0:
+    insts = insts[:LIMIT]
+count = 0
+with_choice = 0
+for n, (fid, px, py, pz, rx, ry, rz) in enumerate(insts):
+    entry = lib.get(str(fid))
+    if entry is None:
+        continue
+    show, cols = entry
+    R = C @ Euler((rx, ry, rz), EULER_ORDER).to_matrix() @ C_INV
+    p = C @ Vector((px, py, pz))
+    m = Matrix.Translation(p * UNIT_SCALE) @ (R * UNIT_SCALE).to_4x4()
+    m[3][3] = 1.0
+    if len(cols) == 1:
+        make_empty('%s_%d' % (fid, n), cols[0][1], m, placed)
+    else:
+        if choices is None:
+            choices = bpy.data.collections.new('%s_choices' % SCENE_NAME)
+            bpy.context.scene.collection.children.link(choices)
+        grp = bpy.data.collections.new('%s_%d' % (fid, n))
+        choices.children.link(grp)
+        for k, (label, col) in enumerate(cols):
+            e = make_empty('%s_%d_%s' % (fid, n, label), col, m, grp)
+            if k != show:
+                e.hide_set(True)
+                e.hide_render = True
+        with_choice += 1
     count += 1
 
-print('Placed %d instance(s) of %d model(s).' % (count, len(lib)))
+print('Placed %d instance(s) of %d model(s); %d placement(s) have several versions (one visible, the rest hidden in place).' % (count, len(lib), with_choice))
+"#;
+
+const GRID_TEMPLATE: &str = r#"# Generated by land_export --scene --scene-grid. Run in Blender: Scripting tab -> Open -> Run Script.
+# Lays out every model once. All versions of one model (alliance banners/shields, ...) sit in the same cell,
+# stacked vertically with a small gap, so you can see each of them and know they come from one model file.
+# Each model has a collection 'model_<fileindex>' (with one sub-collection per version) and a small axes empty
+# named 'model_<fileindex>' at the corner of its cell.
+import bpy, json, os
+from mathutils import Vector
+
+SCENE_NAME = '@NAME@'
+SIDECAR = @SIDECAR@
+BAKED_SCENES_DIR = @SCENES_ABS@
+BAKED_MODELS_DIR = @MODELS_ABS@
+
+# ---- knobs ---------------------------------------------------------------------------------
+GAP = 0.15               # space between neighbouring cells, as a fraction of the largest model
+STACK_GAP = 0.10         # space between stacked versions, as a fraction of the version's height (min 2% of largest model)
+ROW_WIDTH_FACTOR = 1.3   # wider = fewer, longer rows
+# ---------------------------------------------------------------------------------------------
+
+try:
+    HERE = os.path.dirname(os.path.abspath(__file__))
+except NameError:
+    HERE = BAKED_SCENES_DIR
+if not os.path.exists(os.path.join(HERE, SIDECAR)):
+    HERE = BAKED_SCENES_DIR
+MODELS_DIR = os.path.normpath(os.path.join(HERE, '..', 'models'))
+if not os.path.isdir(MODELS_DIR):
+    MODELS_DIR = BAKED_MODELS_DIR
+
+with open(os.path.join(HERE, SIDECAR), 'r') as fh:
+    data = json.load(fh)
+
+
+def import_obj(path):
+    before = set(bpy.data.objects)
+    if hasattr(bpy.ops.wm, 'obj_import'):
+        bpy.ops.wm.obj_import(filepath=path, forward_axis='NEGATIVE_Z', up_axis='Y')
+    else:
+        bpy.ops.import_scene.obj(filepath=path, axis_forward='-Z', axis_up='Y')
+    return [o for o in bpy.data.objects if o not in before]
+
+
+def bounds(objs):
+    mn = Vector((1e30, 1e30, 1e30))
+    mx = Vector((-1e30, -1e30, -1e30))
+    found = False
+    for o in objs:
+        if o.type != 'MESH':
+            continue
+        for corner in o.bound_box:
+            w = o.matrix_world @ Vector(corner)
+            for i in range(3):
+                mn[i] = min(mn[i], w[i])
+                mx[i] = max(mx[i], w[i])
+            found = True
+    if not found:
+        return Vector((0, 0, 0)), Vector((0, 0, 0))
+    return mn, mx
+
+
+root = bpy.data.collections.new(SCENE_NAME)
+bpy.context.scene.collection.children.link(root)
+
+# 1. import every version of every model
+items = []
+for fid, versions in data['models']:
+    grp = bpy.data.collections.new('model_%s' % fid)
+    root.children.link(grp)
+    vs = []
+    for label, obj_name in versions:
+        path = os.path.join(MODELS_DIR, obj_name)
+        try:
+            objs = import_obj(path)
+        except Exception as e:
+            print('Import failed for', path, e)
+            continue
+        if not objs:
+            continue
+        col = bpy.data.collections.new('model_%s_%s' % (fid, label))
+        grp.children.link(col)
+        for o in objs:
+            for c in list(o.users_collection):
+                c.objects.unlink(o)
+            col.objects.link(o)
+        vs.append({'label': label, 'objs': objs})
+    if vs:
+        items.append({'fid': fid, 'grp': grp, 'versions': vs})
+
+bpy.context.view_layer.update()
+if not items:
+    raise RuntimeError('Nothing could be imported from %s' % MODELS_DIR)
+
+for it in items:
+    it['w'] = 0.0
+    it['d'] = 0.0
+    for v in it['versions']:
+        v['mn'], v['mx'] = bounds(v['objs'])
+        it['w'] = max(it['w'], v['mx'].x - v['mn'].x)
+        it['d'] = max(it['d'], v['mx'].y - v['mn'].y)
+
+# 2. lay the cells out in rows
+biggest = max(max(it['w'], it['d']) for it in items) or 1.0
+gap = biggest * GAP
+total = sum((it['w'] + gap) * (it['d'] + gap) for it in items)
+row_limit = max(total ** 0.5 * ROW_WIDTH_FACTOR, max(it['w'] for it in items) + gap)
+
+x = y = row_d = 0.0
+for it in items:
+    if x > 0 and x + it['w'] > row_limit:
+        x = 0.0
+        y += row_d + gap
+        row_d = 0.0
+    cx = x + it['w'] / 2.0
+    cy = y + it['d'] / 2.0
+    z = 0.0
+    for v in it['versions']:
+        mn, mx = v['mn'], v['mx']
+        delta = Vector((cx - (mn.x + mx.x) / 2.0, cy - (mn.y + mx.y) / 2.0, z - mn.z))
+        for o in v['objs']:
+            o.location = o.location + delta
+        h = mx.z - mn.z
+        z += h + max(h * STACK_GAP, biggest * 0.02)
+    marker = bpy.data.objects.new('model_%s' % it['fid'], None)
+    marker.empty_display_type = 'PLAIN_AXES'
+    marker.empty_display_size = biggest * 0.05
+    marker.location = (x, y, 0.0)
+    it['grp'].objects.link(marker)
+    x += it['w'] + gap
+    row_d = max(row_d, it['d'])
+
+print('Laid out %d model(s); %d have several versions stacked vertically.' % (len(items), sum(1 for it in items if len(it['versions']) > 1)))
 "#;
