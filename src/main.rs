@@ -63,6 +63,7 @@ struct Args {
     scene_grid: bool,
     keeps: bool,
     keep_key: Option<u32>,
+    keep_list: bool,
     alliance: Option<String>,
     no_auto_variants: bool,
     world_model_lut: bool,
@@ -187,12 +188,13 @@ Options:\n  \
 --world-lut          Export the world table and write luts/worlds_lut.csv\n \
 --model-lut          Export the models table and write luts/models_lut.csv\n \
 --creature-lut       Export the creatures table, creature models and creature textures table and write luts/creatures_lut.csv\n \
+--keep-lut           Export the keeps table (0x5a) and write luts/keeps_lut.csv\n \
 --item-lut           Export the item visual templates (0x58), part materials (0x50), materials (0x05) and item names (0x171) tables and write luts/items_lut.csv\n \
 --world-model-lut    For EVERY world: export its placement files and write luts/worlds/world_0x<id>.csv\n  \
                        (model_id,x,y,z; sorted; from the world placement file only). Each archive is exported once.\n \
 --worlds <list>      With --world-model-lut: only these worlds (comma-separated, hex or decimal)\n \
 --with-rot           With --world-model-lut: also write rx,ry,rz columns\n \
---all-luts           Write every LUT (run once per patch): the world, model, creature and item LUTs share one archive export, then\n                       --world-model-lut runs. --exe/--mnf/--manifest/--out/--worlds/--with-rot/--dry-run/--no-cleanup apply\n \
+--all-luts           Write every LUT (run once per patch): the world, model, creature, item and keep LUTs share one archive export, then\n                       --world-model-lut runs. --exe/--mnf/--manifest/--out/--worlds/--with-rot/--dry-run/--no-cleanup apply\n \
 --
 ",
         MNF_EXPORT, RAW_MNF, DEFAULT_EXE, DEFAULT_OUT, NOESIS
@@ -227,6 +229,7 @@ fn parse_args() -> Args {
     let mut scene_script_only = false;
     let mut scene_grid = false;
     let mut keeps = false;
+    let mut keep_list = false;
     let mut keep_key = None;
     let mut alliance: Option<String> = None;
     let mut no_auto_variants = false;
@@ -269,6 +272,7 @@ fn parse_args() -> Args {
             "--model-lut" => model_list = true,
             "--creature-lut" => creature_list = true,
             "--item-lut" => item_list = true,
+            "--keep-lut" => keep_list = true,
             "--size-map" => size_map = true,
             "--world-model-lut" => world_model_lut = true,
             "--with-rot" => lut_rot = true,
@@ -339,7 +343,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    let world = if !model_fis.is_empty() || !scene.is_empty() || list_worlds || world_lut || model_list || creature_list || item_list || keeps || world_model_lut || all_luts {
+    let world = if !model_fis.is_empty() || !scene.is_empty() || list_worlds || world_lut || model_list || creature_list || item_list || keep_list || keeps || world_model_lut || all_luts {
         0
     } else {
         let world_str: &String = match positional.len() {
@@ -384,6 +388,7 @@ fn parse_args() -> Args {
         scene_grid,
         keeps,
         keep_key,
+        keep_list,
         alliance,
         no_auto_variants,
         world_model_lut,
@@ -483,6 +488,17 @@ fn build_item_lut(found: &[manifest::TableMatch], dir: &str) -> Result<(), Strin
     Ok(())
 }
 
+fn build_keep_lut(m: &manifest::TableMatch, dir: &str) -> Result<(), String> {
+    let entry = find_uncompressed(dir, m.index)
+        .ok_or_else(|| format!("Keeps file '{}_Uncompressed' not found under '{}'.", m.index, dir))?;
+    std::fs::create_dir_all(LUT_DIR).map_err(|e| format!("failed to create luts dir: {}", e))?;
+    let out_path = Path::new(LUT_DIR).join("keeps_lut.csv");
+    let n = keep_export::write_lut(&entry, &out_path)
+        .map_err(|e| format!("Error parsing '{}': {}", entry.display(), e))?;
+    println!("Wrote {} keeps -> {}", n, out_path.display());
+    Ok(())
+}
+
 fn table_match(args: &Args, fi: u32, label: &str) -> Result<manifest::TableMatch, String> {
     match manifest::filter_table_manifest(&args.manifest, fi) {
         Ok(Some(m)) => { println!("{}: index {} (arch {})", label, m.index, m.arch); Ok(m) }
@@ -491,7 +507,7 @@ fn table_match(args: &Args, fi: u32, label: &str) -> Result<manifest::TableMatch
     }
 }
 
-/// World, model, creature and item LUTs share their archive(s): export it once, then build all four.
+/// World, model, creature, item and keep LUTs share their archive(s): export it once, then build all five.
 fn run_core_luts(args: &Args) -> Result<(), String> {
     let world = table_match(args, manifest::WORLD_LUT_FILE_INDEX, "world table")?;
     let model_m = table_match(args, manifest::MODEL_LIST_FILE_INDEX, "model list")?;
@@ -499,6 +515,7 @@ fn run_core_luts(args: &Args) -> Result<(), String> {
     for (fi, label) in [(0x05u32, "textures"), (0x06, "links"), (0x07, "models"), (0x08, "creatures")] {
         creature_set.push(table_match(args, fi, label)?);
     }
+    let keep_m = table_match(args, keep_export::KEEPS_FILE_INDEX, "keeps")?;
     let mut item_set = Vec::new();
     for (fi, label) in [
         (items::MATERIAL_DEF, "materials"),
@@ -511,6 +528,7 @@ fn run_core_luts(args: &Args) -> Result<(), String> {
 
     let all: Vec<&manifest::TableMatch> = std::iter::once(&world)
         .chain(std::iter::once(&model_m))
+        .chain(std::iter::once(&keep_m))
         .chain(creature_set.iter())
         .chain(item_set.iter())
         .collect();
@@ -539,6 +557,7 @@ fn run_core_luts(args: &Args) -> Result<(), String> {
     if let Err(e) = build_model_lut(&model_m, &args.out) { errors.push(e); }
     if let Err(e) = build_creature_lut(&creature_set, &args.out) { errors.push(e); }
     if let Err(e) = build_item_lut(&item_set, &args.out) { errors.push(e); }
+    if let Err(e) = build_keep_lut(&keep_m, &args.out) { errors.push(e); }
 
     if !args.no_cleanup { let _ = std::fs::remove_dir_all(&args.out); }
     if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) }
@@ -644,8 +663,8 @@ fn main() {
             std::process::exit(1);
         }
         let mut failed: Vec<&str> = Vec::new();
-        println!("===== [1/2] world, model, creature and item LUTs (one export) =====");
-        if let Err(e) = run_core_luts(&args) { eprintln!("{}", e); failed.push("world/model/creature/item LUTs"); }
+        println!("===== [1/2] world, model, creature, item and keep LUTs (one export) =====");
+        if let Err(e) = run_core_luts(&args) { eprintln!("{}", e); failed.push("world/model/creature/item/keep LUTs"); }
         println!("\n===== [2/2] per-world model LUTs =====");
         if let Err(e) = run_world_model_lut(&args) { eprintln!("{}", e); failed.push("per-world model LUTs"); }
         if failed.is_empty() {
@@ -870,6 +889,32 @@ fn main() {
         if args.dry_run { println!("\nDry run complete."); return; }
 
         if let Err(e) = build_model_lut(&m, &args.out) { eprintln!("{}", e); std::process::exit(1); }
+        if !args.no_cleanup { let _ = std::fs::remove_dir_all(&args.out); }
+        return;
+    }
+
+    if args.keep_list {
+        let m = match manifest::filter_table_manifest(&args.manifest, keep_export::KEEPS_FILE_INDEX) {
+            Ok(Some(m)) => m,
+            Ok(None) => { eprintln!("Keeps (file_index 0x{:x}) not found in manifest.", keep_export::KEEPS_FILE_INDEX); std::process::exit(1); }
+            Err(e) => { eprintln!("Failed to read manifest '{}': {}", args.manifest, e); std::process::exit(1); }
+        };
+        println!("Keeps: index {} (arch {})", m.index, m.arch);
+
+        if !args.skip_export {
+            if !export::export_archive_combined(&args.exe, &args.mnf, &args.out, m.arch, args.dry_run) {
+                eprintln!("Archive export reported an error; check output above before continuing.");
+            }
+            if !args.no_cleanup {
+                let mut wanted = HashSet::new();
+                wanted.insert(m.index);
+                let (kept, removed) = export::cleanup_export_dir_keeping(&args.out, &wanted, &[], args.dry_run);
+                println!("Kept {} files, removed {} files.", kept, removed);
+            }
+        }
+        if args.dry_run { println!("\nDry run complete."); return; }
+
+        if let Err(e) = build_keep_lut(&m, &args.out) { eprintln!("{}", e); std::process::exit(1); }
         if !args.no_cleanup { let _ = std::fs::remove_dir_all(&args.out); }
         return;
     }

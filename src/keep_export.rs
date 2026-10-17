@@ -7,9 +7,10 @@ const ROW_MARK: &[u8; 4] = b"####";
 const ROW_HDR: usize = 32;
 
 const PIECE_MODEL_OFF: usize = 73;
+const KEEP_WORLD_OFF: usize = 59;
 const KEEP_POS_OFF: usize = 63;
 const KEEP_HEAD_OFF: usize = 75;
-const KEEP_GRID_OFF: usize = 79; // S, S, N
+const KEEP_GRID_OFF: usize = 79;
 const KEEP_ENTRIES_OFF: usize = 91;
 
 pub const KEEPS_FILE_INDEX: u32 = 0x5a;
@@ -35,6 +36,7 @@ struct Placed {
 #[derive(Debug)]
 struct Keep {
     key: u32,
+    world: u32,
     pos_cm: [i32; 3],
     heading_deg: f32,
     grid: i32,
@@ -100,6 +102,7 @@ fn parse_keeps(path: &Path) -> Result<Vec<Keep>, String> {
     let mut keeps = Vec::new();
     for row in split_rows(&data, "keeps (1144)")? {
         let key = be_u32(row, 32)?;
+        let world = be_u32(row, KEEP_WORLD_OFF)?;
         let pos_cm = [
             be_i32(row, KEEP_POS_OFF)?,
             be_i32(row, KEEP_POS_OFF + 4)?,
@@ -126,9 +129,30 @@ fn parse_keeps(path: &Path) -> Result<Vec<Keep>, String> {
             o += 20 + 4 * k as usize;
             placed.push(Placed { piece, gx, gz, rot_deg });
         }
-        keeps.push(Keep { key, pos_cm, heading_deg, grid, placed });
+        keeps.push(Keep { key, world, pos_cm, heading_deg, grid, placed });
     }
     Ok(keeps)
+}
+
+pub fn write_lut(keeps_file: &Path, out_path: &Path) -> Result<usize, String> {
+    let mut keeps = parse_keeps(keeps_file)?;
+    keeps.sort_by_key(|k| k.key);
+
+    let mut out = String::from("key,world,grid,pos_x_cm,pos_y_cm,pos_z_cm,heading_deg,pieces\n");
+    for k in &keeps {
+        out.push_str(&format!(
+            "{},{},{},{},{},{},{},{}\n",
+            k.key, k.world, k.grid, k.pos_cm[0], k.pos_cm[1], k.pos_cm[2], k.heading_deg,
+            k.placed.len()
+        ));
+    }
+    if let Some(dir) = out_path.parent() {
+        if !dir.as_os_str().is_empty() {
+            fs::create_dir_all(dir).map_err(|e| format!("Failed to create '{}': {}", dir.display(), e))?;
+        }
+    }
+    fs::write(out_path, out).map_err(|e| format!("Failed to write '{}': {}", out_path.display(), e))?;
+    Ok(keeps.len())
 }
 
 pub fn run(a: &KeepArgs) -> Result<PathBuf, String> {
@@ -151,8 +175,8 @@ pub fn run(a: &KeepArgs) -> Result<PathBuf, String> {
 
         let (gxmin, gxmax) = k.placed.iter().fold((i32::MAX, i32::MIN), |a, p| (a.0.min(p.gx), a.1.max(p.gx)));
         let (gzmin, gzmax) = k.placed.iter().fold((i32::MAX, i32::MIN), |a, p| (a.0.min(p.gz), a.1.max(p.gz)));
-        println!("keep {}: grid {}, pos_cm {:?}, heading {}, {} pieces, gx {}..{}, gz {}..{}",
-            k.key, k.grid, k.pos_cm, k.heading_deg, k.placed.len(), gxmin, gxmax, gzmin, gzmax);
+        println!("keep {}: world {}, grid {}, pos_cm {:?}, heading {}, {} pieces, gx {}..{}, gz {}..{}",
+            k.key, k.world, k.grid, k.pos_cm, k.heading_deg, k.placed.len(), gxmin, gxmax, gzmin, gzmax);
 
         let kx = k.pos_cm[0] as f64 / 100.0;
         let ky = k.pos_cm[1] as f64 / 100.0;

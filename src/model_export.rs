@@ -177,11 +177,33 @@ pub struct MatMap {
     pub file_index: u32,
 }
 
+/// How the game draws a material's diffuse alpha channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AlphaMode {
+    /// Opaque: the alpha channel holds unrelated data and must be ignored.
+    None,
+    /// Cutout (alpha test): a pixel is either drawn or discarded. Foliage, trims, fences.
+    Mask,
+    /// Blended (true transparency): glass and the like.
+    Blend,
+}
+
+impl AlphaMode {
+    /// Name written into the .mtl as `# alpha_mode <name>` for the Blender scripts to read.
+    pub fn mtl_name(self) -> Option<&'static str> {
+        match self {
+            AlphaMode::None => None,
+            AlphaMode::Mask => Some("mask"),
+            AlphaMode::Blend => Some("blend"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct MatDef {
     pub name: String,
     pub maps: Vec<MatMap>,
-    pub alpha: bool,
+    pub alpha: AlphaMode,
     /// Where the material lives in the .gr2. Two materials can share a name (with different textures),
     /// but never a key.
     pub key: (u32, u32),
@@ -349,15 +371,23 @@ impl<'a> Gr2<'a> {
         if out.is_empty() {
             return None;
         }
-        let alpha = self.ext_alpha(m).unwrap_or(true);
+        let alpha = self.ext_alpha(m).unwrap_or(AlphaMode::Blend);
         Some(MatDef { name, maps: out, alpha, key: m })
     }
 
-    fn ext_alpha(&self, m: (u32, u32)) -> Option<bool> {
+    /// How the game draws this material's alpha, from two signals in the material's properties:
+    /// * the `alpha` mode value: 1 = opaque, 3 = cutout, 5 = blended (seen on Water/BadFurnTrim,
+    ///   Trim001, glass respectively). Some blended materials such as `glass` leave both flags at 0, so
+    ///   this is the primary signal.
+    /// * the `bAlphaMaskEnable` / `bAlphaTransparency` flags: used when the mode value is missing or 1.
+    /// `None` means no alpha property was found at all.
+    fn ext_alpha(&self, m: (u32, u32)) -> Option<AlphaMode> {
         let (s, o) = m;
         let (ts, mut t) = self.ptr(s, o + 28)?;
         let (os, oo) = self.ptr(s, o + 36)?;
-        let (mut pos, mut flag, mut seen) = (0u32, false, false);
+        let (mut pos, mut seen) = (0u32, false);
+        let (mut mask, mut trans) = (false, false);
+        let mut mode: Option<u32> = None;
         for _ in 0..512 {
             let mt = self.u32(ts, t)?;
             if mt == 0 {
@@ -374,18 +404,33 @@ impl<'a> Gr2<'a> {
             };
             if mt == 19 || mt == 20 {
                 if let Some(nm) = self.ptr(ts, t + 4).and_then(|p| self.cstr(p)) {
-                    if nm == "bAlphaTransparency" || nm == "bAlphaMaskEnable" {
-                        seen = true;
-                        if self.u32(os, oo + pos)? != 0 {
-                            flag = true;
+                    match nm.as_str() {
+                        "bAlphaMaskEnable" => {
+                            seen = true;
+                            mask = self.u32(os, oo + pos)? != 0;
                         }
+                        "bAlphaTransparency" => {
+                            seen = true;
+                            trans = self.u32(os, oo + pos)? != 0;
+                        }
+                        "alpha" => mode = self.u32(os, oo + pos),
+                        _ => {}
                     }
                 }
             }
             pos += size;
             t += 44;
         }
-        if seen { Some(flag) } else { None }
+        if !seen && mode.is_none() {
+            return None;
+        }
+        Some(match mode {
+            Some(v) if v >= 5 => AlphaMode::Blend,
+            Some(2..=4) => AlphaMode::Mask,
+            _ if trans => AlphaMode::Blend,
+            _ if mask => AlphaMode::Mask,
+            _ => AlphaMode::None,
+        })
     }
 
     fn at(&self, s: u32, o: u32, n: usize) -> Option<&'a [u8]> {
@@ -898,7 +943,7 @@ fn materials_from_triples(blob: &[u8]) -> Vec<MatDef> {
         .enumerate()
         .map(|(i, set)| MatDef {
             name: format!("material{}", i),
-            alpha: true,
+            alpha: AlphaMode::Blend,
             key: (u32::MAX, i as u32),
             maps: set
                 .into_iter()
@@ -914,7 +959,7 @@ fn materials_from_triples(blob: &[u8]) -> Vec<MatDef> {
 struct MatPng {
     name: String,
     png: [Option<String>; 3],
-    alpha: bool,
+    alpha: AlphaMode,
     key: (u32, u32),
 }
 
@@ -1556,11 +1601,16 @@ fn finish_obj(src: &Path, out_dir: &Path, stem: &str, model_mats: &[MatPng],
                 None => println!("    usemtl '{}' -> no textures", m),
             }
             mtl.push_str(&format!("newmtl {}\nKa 1.000 1.000 1.000\nKd 1.000 1.000 1.000\nKs 0.200 0.200 0.200\nNs 20.0\nd 1.0\nillum 2\n", m));
+            let alpha = slot.map_or(AlphaMode::None, |s| s.alpha);
+            if let Some(name) = alpha.mtl_name() {
+                // Blender's importer ignores this line; the scene scripts read it to pick the blend mode.
+                mtl.push_str(&format!("# alpha_mode {}\n", name));
+            }
             if let Some(p) = tex(0) {
                 mtl.push_str(&format!("map_Kd {}\n", p));
                 // Only use the diffuse alpha as opacity when the material asks for it; otherwise the
                 // alpha channel holds unrelated data and would make solid surfaces look see-through.
-                if slot.map_or(false, |s| s.alpha) {
+                if alpha != AlphaMode::None {
                     mtl.push_str(&format!("map_d {}\n", p));
                 }
             }
