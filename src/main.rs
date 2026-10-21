@@ -1,5 +1,11 @@
+// When exporting, always check the number of files to export.
+// Successfully exported 7380 sub-files in 9.53363 secs!
+// Copied 2 of 2 texture(s) -> ./export\terrain_textures
+// This ^^ should NEVER happen. Why would I export 8000 fils just to copy two of them and trash the rest???
+// If there is <10 files in an archive, just export each one of them individually.
 mod export;
 mod landfile;
+mod lodmesh;
 mod manifest;
 mod reader;
 mod colourmap;
@@ -14,6 +20,7 @@ mod model_export;
 mod scene_export;
 mod keep_export;
 mod world_models;
+mod terrain_textures;
 
 use landfile::{fixed_channel_range, save_rgb_from_channels, LandFile, RawBigImage, RawTile};
 use manifest::filter_manifest;
@@ -46,6 +53,8 @@ struct Args {
     no_cleanup: bool,
     channels: Option<Vec<usize>>,
     placement_only: bool,
+    lod_only: bool,
+    lod_no_skirts: bool,
     list_worlds: bool,
     world_lut: bool,
     model_list: bool,
@@ -55,6 +64,8 @@ struct Args {
     size_type: Option<u32>,
     size_scale: u32,
     model_fis: Vec<u32>,
+    creature_ids: Vec<u32>,
+    rig_format: String,
     noesis: String,
     scene: Vec<String>,
     cell_size: f64,
@@ -70,6 +81,7 @@ struct Args {
     lut_worlds: Vec<u32>,
     lut_rot: bool,
     all_luts: bool,
+    terrain_textures: bool,
 }
 
 fn parse_int_arg(s: &str) -> u32 {
@@ -93,17 +105,21 @@ fn parse_channels_arg(s: &str) -> Vec<usize> {
         .collect()
 }
 
+/// Names follow the world TOC: its `terrain-*` .dat entries, in order, are the land file's 10 records.
+/// 0/6 are confirmed by their data (heights, unit normals); 2-5 sum to ~255 per pixel across their 16 bytes (blend
+/// weights); 7 is ~all 0xFFFF with a few 0s (hole mask); the rest are matched by TOC order and shape only.
 fn channel_label(index: usize) -> String {
     match index {
         0 => "00_heightmap".to_string(),
-        1 => "01_dev_overlay".to_string(),
-        2 => "02_unknown".to_string(),
-        3 => "03_unknown".to_string(),
-        4 => "04_unknown".to_string(),
-        5 => "05_unknown".to_string(),
+        1 => "01_color_raw".to_string(),
+        2 => "02_blend0".to_string(),
+        3 => "03_blend1".to_string(),
+        4 => "04_blend2".to_string(),
+        5 => "05_blend3".to_string(),
         6 => "06_normal".to_string(),
-        7 => "07_unknown".to_string(),
-        8 => "08_unknown".to_string(),
+        7 => "07_hole".to_string(),
+        8 => "08_clutter".to_string(),
+        9 => "09_clutter_pts".to_string(),
         other => format!("{:02}_unknown", other),
     }
 }
@@ -157,6 +173,44 @@ fn write_placements(
     failures
 }
 
+fn index_files(scan_dir: &str) -> HashMap<u32, std::path::PathBuf> {
+    let mut paths: HashMap<u32, std::path::PathBuf> = HashMap::new();
+    for entry in WalkDir::new(scan_dir).into_iter().filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_file() { continue; }
+        if let Some(idx) = path.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u32>().ok()) {
+            paths.entry(idx).or_insert_with(|| path.to_path_buf());
+        }
+    }
+    paths
+}
+
+/// Terrain LOD meshes (manifest type 0x0A) -> `<output_dir>/lod_x<X>_z<Z>_ch<N>.obj`, one per record in each file.
+/// Returns the number of failed files.
+fn write_lod_meshes(
+    scan_dir: &str,
+    lods: &[manifest::LodMatch],
+    cell_size: f64,
+    skirts: bool,
+    output_dir: &Path,
+) -> usize {
+    let paths = index_files(scan_dir);
+    let (mut ok_files, mut obj_count, mut failures) = (0usize, 0usize, 0usize);
+    for l in lods {
+        let Some(path) = paths.get(&l.index) else {
+            eprintln!("Warning: LOD mesh file (index {}, cell {},{}) not found under '{}'.", l.index, l.x, l.z, scan_dir);
+            failures += 1;
+            continue;
+        };
+        match lodmesh::export_file(path, l.x, l.z, cell_size, skirts, output_dir) {
+            Ok(written) => { ok_files += 1; obj_count += written.len(); }
+            Err(e) => { eprintln!("Error parsing LOD mesh '{}': {}", path.display(), e); failures += 1; }
+        }
+    }
+    println!("Exported {}/{} terrain LOD files ({} OBJ) -> {}", ok_files, lods.len(), obj_count, output_dir.display());
+    failures
+}
+
 fn print_usage() {
     eprintln!(
         "Usage: land_export (or cargo run) <world> [options]\n\n\
@@ -173,9 +227,11 @@ Options:\n  \
 --no-cleanup         Keep every file the archive export dumped\n  \
 --no-auto-variants  Don't split overlapping meshes (alternative versions) into separate OBJs; by default every\n                       model with such meshes is exported once per version (<index>_<mesh>.obj)\n  \
 --model <FileIndex>  Export a model + textures + .obj/.mtl into export/models/ (one flat folder).\n                       Repeat the flag or use commas for several: --model 0x15b253,0x15b254\n  \
+--creature <id>      Export a creature's model + diffuse/normal/specular textures + .obj/.mtl into export/models/.\n                       <id> is a table_id (first column) or creature_id (second column) of luts/creatures_lut.csv;\n                       repeat the flag or use commas for several. Run --creature-lut first to build the CSV.\n  \
+--rig-format <ext>   With --creature: format of the skinned (mesh + skeleton + weights) export written by Noesis,\n                       by extension (default fbx; others to try: glb, dae, smd)\n  \
 --noesis <path>      Path to Noesis64.exe (default: {})\n  \
 --scene <paths>      Export every model used by placement JSON file(s) or folder(s) (comma-separated or repeated;\n                       world placement.json and cell_x#_z#.json both work), then write a Blender script that\n                       places them as collection-instance references into export/scenes/\n  \
---cell-size <n>      World units per cell for cell_x#_z# files (default 250; 0 = don't offset)\n  \
+--cell-size <n>      World units per cell for cell_x#_z# files and the LOD meshes (default 250; 0 = don't offset)\n  \
 --scene-name <name>  Output name for the scene .py/.json (default: derived from the world_0x.. folder)\n  \
 --scene-script-only  With --scene: don't export models, only (re)write the scene files from existing OBJs\n  \
 --scene-grid         With --scene: write <name>_grid.py instead of the placed scene: every model once, in a grid, with all of its\n                       versions stacked vertically in its cell\n  \
@@ -184,12 +240,15 @@ Options:\n  \
 --size-type <n>      File type (low 5 bits of Unk1) to use for --size-map (default: 0x15, cell placement files)\n  \
 --size-scale <n>     Pixels per cell in the --size-map image (default: 16)\n  \
 --placement-only     Only export/parse the placement (instance) file for this world; skip terrain/colourmap entirely\n  \
+--lod-only           Only export the terrain LOD meshes (file type 0x0A, one per 2x2 cells) for this world as OBJ files in\n                       export/world_0x<id>/terrain_lod/; skip everything else\n  \
+--lod-no-skirts      Leave the edge-skirt triangles out of the LOD meshes (by default they are a separate `g skirt` group)\n  \
 --list-worlds        List every world found in the manifest with terrain cell data, and its grid size (no export/world arg needed)\n \
 --world-lut          Export the world table and write luts/worlds_lut.csv\n \
 --model-lut          Export the models table and write luts/models_lut.csv\n \
 --creature-lut       Export the creatures table, creature models and creature textures table and write luts/creatures_lut.csv\n \
 --keep-lut           Export the keeps table (0x5a) and write luts/keeps_lut.csv\n \
 --item-lut           Export the item visual templates (0x58), part materials (0x50), materials (0x05) and item names (0x171) tables and write luts/items_lut.csv\n \
+--terrain-textures  Parse the terrain texture table (file id 0x29), export every texture it references into export/terrain_textures/\n                       and write luts/terrain_textures_lut.csv. Textures already exported are skipped, so it can be re-run/resumed.\n                       Archives needing fewer than 10 of the textures are exported file-by-file instead of as a whole archive\n \
 --world-model-lut    For EVERY world: export its placement files and write luts/worlds/world_0x<id>.csv\n  \
                        (model_id,x,y,z; sorted; from the world placement file only). Each archive is exported once.\n \
 --worlds <list>      With --world-model-lut: only these worlds (comma-separated, hex or decimal)\n \
@@ -213,6 +272,8 @@ fn parse_args() -> Args {
     let mut no_cleanup = false;
     let mut channels: Option<Vec<usize>> = None;
     let mut placement_only = false;
+    let mut lod_only = false;
+    let mut lod_no_skirts = false;
     let mut list_worlds = false;
     let mut world_lut = false;
     let mut model_list = false;
@@ -222,6 +283,8 @@ fn parse_args() -> Args {
     let mut size_type: Option<u32> = None;
     let mut size_scale: u32 = 16;
     let mut model_fis: Vec<u32> = Vec::new();
+    let mut creature_ids: Vec<u32> = Vec::new();
+    let mut rig_format = String::from("fbx");
     let mut noesis = NOESIS.to_string();
     let mut scene: Vec<String> = Vec::new();
     let mut cell_size: f64 = 250.0;
@@ -237,6 +300,7 @@ fn parse_args() -> Args {
     let mut lut_worlds: Vec<u32> = Vec::new();
     let mut lut_rot = false;
     let mut all_luts = false;
+    let mut terrain_textures = false;
 
     let mut i = 0;
     while i < raw.len() {
@@ -267,6 +331,8 @@ fn parse_args() -> Args {
             "--no-cleanup" => no_cleanup = true,
             "--no-auto-variants" => no_auto_variants = true,
             "--placement-only" => placement_only = true,
+            "--lod-only" => lod_only = true,
+            "--lod-no-skirts" => lod_no_skirts = true,
             "--list-worlds" => list_worlds = true,
             "--world-lut" => world_lut = true,
             "--model-lut" => model_list = true,
@@ -277,6 +343,7 @@ fn parse_args() -> Args {
             "--world-model-lut" => world_model_lut = true,
             "--with-rot" => lut_rot = true,
             "--all-luts" => all_luts = true,
+            "--terrain-textures" => terrain_textures = true,
             "--worlds" => {
                 i += 1;
                 let val = raw.get(i).expect("--worlds needs a value");
@@ -295,6 +362,21 @@ fn parse_args() -> Args {
                 let val = raw.get(i).expect("--model needs a FileIndex");
                 for part in val.split(',').map(str::trim).filter(|p| !p.is_empty()) {
                     model_fis.push(parse_int_arg(part));
+                }
+            }
+            "--creature" => {
+                i += 1;
+                let val = raw.get(i).expect("--creature needs an id");
+                for part in val.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    creature_ids.push(parse_int_arg(part));
+                }
+            }
+            "--rig-format" => {
+                i += 1;
+                let val = raw.get(i).expect("--rig-format needs an extension (fbx, glb, dae, smd, ...)");
+                rig_format = val.trim().trim_start_matches('.').to_ascii_lowercase();
+                if rig_format.is_empty() || !rig_format.chars().all(|c| c.is_ascii_alphanumeric()) {
+                    panic!("invalid --rig-format: {}", val);
                 }
             }
             "--scene" => {
@@ -343,7 +425,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    let world = if !model_fis.is_empty() || !scene.is_empty() || list_worlds || world_lut || model_list || creature_list || item_list || keep_list || keeps || world_model_lut || all_luts {
+    let world = if !model_fis.is_empty() || !creature_ids.is_empty() || !scene.is_empty() || list_worlds || world_lut || model_list || creature_list || item_list || keep_list || keeps || world_model_lut || all_luts || terrain_textures {
         0
     } else {
         let world_str: &String = match positional.len() {
@@ -371,6 +453,8 @@ fn parse_args() -> Args {
         no_cleanup,
         channels,
         placement_only,
+        lod_only,
+        lod_no_skirts,
         list_worlds,
         world_lut,
         model_list,
@@ -380,6 +464,8 @@ fn parse_args() -> Args {
         size_type,
         size_scale,
         model_fis,
+        creature_ids,
+        rig_format,
         noesis,
         scene,
         cell_size,
@@ -395,6 +481,7 @@ fn parse_args() -> Args {
         lut_worlds,
         lut_rot,
         all_luts,
+        terrain_textures,
     }
 }
 
@@ -580,6 +667,178 @@ fn run_world_model_lut(args: &Args) -> Result<(), String> {
     world_models::run(&a)
 }
 
+/// Archives that need fewer textures than this are exported file-by-file instead of dumping the whole archive.
+const INDIVIDUAL_EXPORT_LIMIT: usize = 10;
+
+/// Export one file with `-a <arch> -f <filter>` (same call model_export uses).
+fn export_single(args: &Args, arch: u32, filter: u32) -> bool {
+    println!("Running: {} {} {} -a {} -f {}", args.exe, args.mnf, args.out, arch, filter);
+    if let Err(e) = std::fs::create_dir_all(&args.out) {
+        eprintln!("  Failed to create '{}': {}", args.out, e);
+        return false;
+    }
+    match std::process::Command::new(&args.exe)
+        .arg(&args.mnf)
+        .arg(&args.out)
+        .arg("-a")
+        .arg(arch.to_string())
+        .arg("-f")
+        .arg(filter.to_string())
+        .output()
+    {
+        Ok(out) => {
+            if !out.status.success() {
+                eprintln!("  Warning: exporter exited with status {:?}", out.status.code());
+            }
+            true
+        }
+        Err(e) => {
+            eprintln!("  Failed to launch exporter '{}': {}", args.exe, e);
+            false
+        }
+    }
+}
+
+/// Export a single texture (by manifest Index, falling back to FileIndex like model_export) and copy it to `dest`.
+fn export_texture_individually(args: &Args, row: &model_export::MnfRow, dest: &Path) -> bool {
+    let one: std::collections::BTreeSet<u32> = std::iter::once(row.index).collect();
+    let mut tries = vec![row.index, row.file_index];
+    if row.index == row.file_index {
+        tries.truncate(1);
+    }
+    for filter in tries {
+        if !export_single(args, row.arch, filter) {
+            return false;
+        }
+        if let Ok(n) = terrain_textures::copy_found(Path::new(&args.out), &one, dest) {
+            if n > 0 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Parse the terrain texture table (file id 0x29), export every texture it references and write the LUT.
+fn run_terrain_textures(args: &Args) -> Result<(), String> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let table = table_match(args, terrain_textures::TERRAIN_TEXTURE_FILE_INDEX, "terrain textures table")?;
+    let dest = Path::new(FINAL_EXPORT_DIR).join("terrain_textures");
+    let lut_path = Path::new(LUT_DIR).join("terrain_textures_lut.csv");
+
+    // 1. export the table itself (tables are only available through the combined archive export)
+    if !args.skip_export {
+        println!("\nExporting archive {} (terrain texture table)...", table.arch);
+        if !export::export_archive_combined(&args.exe, &args.mnf, &args.out, table.arch, args.dry_run) {
+            eprintln!("Archive export reported an error; check output above before continuing.");
+        }
+        if !args.no_cleanup {
+            let keep: HashSet<u32> = std::iter::once(table.index).collect();
+            let (kept, removed) = export::cleanup_export_dir_keeping(&args.out, &keep, &[], args.dry_run);
+            println!("Kept {} files, removed {} files.", kept, removed);
+        }
+    }
+    if args.dry_run {
+        println!("\nDry run complete (the table has to be exported before its textures can be listed).");
+        return Ok(());
+    }
+
+    // 2. parse it
+    let entry = find_uncompressed(&args.out, table.index)
+        .ok_or_else(|| format!("Terrain texture table '{}_Uncompressed' not found under '{}'.", table.index, args.out))?;
+    println!("Parsing file: {}", entry.display());
+    let entries = terrain_textures::parse(&entry)?;
+    let wanted: HashSet<u32> = terrain_textures::texture_indices(&entries).into_iter().collect();
+    println!("Parsed {} terrain textures referencing {} distinct texture FileIndexes.", entries.len(), wanted.len());
+
+    // 3. resolve FileIndex -> manifest row (Index + archive)
+    let rows = model_export::lookup_file_indexes(&args.manifest, &wanted)
+        .map_err(|e| format!("Failed to read manifest '{}': {}", args.manifest, e))?;
+    let mut resolved: BTreeMap<u32, model_export::MnfRow> = BTreeMap::new();
+    for fi in &wanted {
+        if let Some(r) = rows.get(fi).and_then(|v| v.first()) {
+            resolved.insert(*fi, r.clone());
+        }
+    }
+    if resolved.len() < wanted.len() {
+        eprintln!("Warning: {} texture FileIndex(es) not found in manifest '{}'.", wanted.len() - resolved.len(), args.manifest);
+    }
+    let fi_to_index: BTreeMap<u32, u32> = resolved.iter().map(|(fi, r)| (*fi, r.index)).collect();
+
+    std::fs::create_dir_all(&dest).map_err(|e| format!("failed to create '{}': {}", dest.display(), e))?;
+
+    // 4. work out what still has to be exported (resumable) and group it by archive
+    let have = terrain_textures::exported_names(&dest, &fi_to_index);
+    let mut by_arch: BTreeMap<u32, Vec<model_export::MnfRow>> = BTreeMap::new();
+    for (fi, r) in &resolved {
+        if !have.contains_key(fi) {
+            by_arch.entry(r.arch).or_default().push(r.clone());
+        }
+    }
+    let todo_total: usize = by_arch.values().map(|v| v.len()).sum();
+    println!("{} texture(s) already exported, {} to go.", have.len(), todo_total);
+
+    if args.skip_export {
+        if todo_total > 0 {
+            let idxs: BTreeSet<u32> = by_arch.values().flatten().map(|r| r.index).collect();
+            match terrain_textures::copy_found(Path::new(&args.out), &idxs, &dest) {
+                Ok(n) => println!("Copied {} texture(s) already on disk under '{}' -> {}", n, args.out, dest.display()),
+                Err(e) => eprintln!("{}", e),
+            }
+        }
+    } else if todo_total > 0 {
+        // always show how many files each archive needs before exporting anything
+        println!("\nExport plan ({} archive(s)):", by_arch.len());
+        for (arch, items) in &by_arch {
+            let mode = if *arch >= manifest::UNAVAILABLE_ARCHIVE_THRESHOLD as u32 {
+                "SKIPPED (not available in the client files)"
+            } else if items.len() < INDIVIDUAL_EXPORT_LIMIT {
+                "file-by-file"
+            } else {
+                "whole archive"
+            };
+            println!("  archive {:>4}: {:>5} texture(s) -> {}", arch, items.len(), mode);
+        }
+
+        for (arch, items) in &by_arch {
+            if *arch >= manifest::UNAVAILABLE_ARCHIVE_THRESHOLD as u32 {
+                continue;
+            }
+            if items.len() < INDIVIDUAL_EXPORT_LIMIT {
+                let mut ok = 0usize;
+                for r in items {
+                    if export_texture_individually(args, r, &dest) {
+                        ok += 1;
+                    } else {
+                        eprintln!("  Texture FileIndex 0x{:x} (Index {}, archive {}) could not be exported.", r.file_index, r.index, r.arch);
+                    }
+                }
+                println!("Archive {}: exported {} of {} texture(s) individually.", arch, ok, items.len());
+            } else {
+                println!("\nExporting archive {} ({} texture(s) needed)...", arch, items.len());
+                if !export::export_archive(&args.exe, &args.mnf, &args.out, *arch, false) {
+                    eprintln!("Archive export reported an error; check output above before continuing.");
+                }
+                let idxs: BTreeSet<u32> = items.iter().map(|r| r.index).collect();
+                match terrain_textures::copy_found(Path::new(&args.out), &idxs, &dest) {
+                    Ok(n) => println!("Copied {} of {} texture(s) -> {}", n, idxs.len(), dest.display()),
+                    Err(e) => eprintln!("{}", e),
+                }
+            }
+            if !args.no_cleanup { let _ = std::fs::remove_dir_all(&args.out); }
+        }
+    }
+
+    // 5. LUT
+    let files = terrain_textures::exported_names(&dest, &fi_to_index);
+    let n = terrain_textures::write_lut(&entries, &files, &lut_path)?;
+    println!("\nWrote {} terrain textures -> {}", n, lut_path.display());
+    println!("{} of {} texture file(s) present in {}", files.len(), wanted.len(), dest.display());
+    if !args.no_cleanup { let _ = std::fs::remove_dir_all(&args.out); }
+    Ok(())
+}
+
 const ANSI_RED: &str = "\x1b[31m";
 const ANSI_RESET: &str = "\x1b[0m";
 
@@ -680,6 +939,11 @@ fn main() {
         return;
     }
 
+    if args.terrain_textures {
+        if let Err(e) = run_terrain_textures(&args) { eprintln!("{}", e); std::process::exit(1); }
+        return;
+    }
+
     if !args.scene.is_empty() {
         let models_dir = Path::new(FINAL_EXPORT_DIR).join("models");
         let scenes_dir = Path::new(FINAL_EXPORT_DIR).join("scenes");
@@ -711,6 +975,45 @@ fn main() {
             }
             Err(e) => { eprintln!("{}", e); std::process::exit(1); }
         }
+        return;
+    }
+
+    if !args.creature_ids.is_empty() {
+        let lut = Path::new(LUT_DIR).join("creatures_lut.csv");
+        let models_dir = Path::new(FINAL_EXPORT_DIR).join("models");
+        let opts = model_export::Options {
+            manifest: &args.manifest,
+            exe: &args.exe,
+            mnf: &args.mnf,
+            temp_dir: &args.out,
+            out_root: &models_dir,
+            dry_run: args.dry_run,
+            skip_export: args.skip_export,
+            keep_temp: args.no_cleanup,
+            noesis: &args.noesis,
+        };
+        let mut failed = 0usize;
+        for id in &args.creature_ids {
+            let rows = match creature::find_in_lut(&lut, *id) {
+                Ok(r) => r,
+                Err(e) => { eprintln!("Cannot read '{}': {} (run --creature-lut first)", lut.display(), e); std::process::exit(1); }
+            };
+            let Some(row) = rows.first() else {
+                eprintln!("Creature {} not found in '{}'.", id, lut.display());
+                failed += 1;
+                continue;
+            };
+            if rows.len() > 1 {
+                eprintln!("Warning: {} creatures match {}; using table_id {} ({}). Others: {}", rows.len(), id, row.table_id, row.name,
+                    rows.iter().skip(1).take(8).map(|r| r.table_id.to_string()).collect::<Vec<_>>().join(", "));
+            }
+            println!("\n=== Creature {} '{}' (creature_id {:06}): model {}, textures {}/{}/{} ===", row.table_id, row.name, row.name_id, row.model, row.tex[0], row.tex[1], row.tex[2]);
+            match model_export::run_with_textures(row.model, Some(row.tex), Some(row.skeleton), &args.rig_format, &opts) {
+                Ok(s) => println!("\nFinished creature {}. {} texture(s) exported, {} missing -> {}", row.table_id, s.textures_found, s.textures_missing, s.out_dir.display()),
+                Err(e) => { eprintln!("{}", e); failed += 1; }
+            }
+        }
+        if failed > 0 { std::process::exit(1); }
         return;
     }
 
@@ -829,6 +1132,60 @@ fn main() {
         }
 
         println!("\nFinished (placement-only).");
+        return;
+    }
+
+    if args.lod_only {
+        println!("LOD-only mode: looking up terrain LOD mesh files for world 0x{:x}...", args.world);
+        let lods = match manifest::filter_lod_manifest(&args.manifest, args.world) {
+            Ok(v) => v,
+            Err(e) => { eprintln!("Failed to read manifest '{}': {}", args.manifest, e); std::process::exit(1); }
+        };
+        if lods.is_empty() {
+            eprintln!("No terrain LOD mesh files found for this world.");
+            std::process::exit(1);
+        }
+        println!("Terrain LOD mesh files: {}", lods.len());
+
+        let mut archs: Vec<u32> = lods.iter().map(|l| l.arch).collect();
+        archs.sort_unstable();
+        archs.dedup();
+        let wanted: HashSet<u32> = lods.iter().map(|l| l.index).collect();
+
+        if !args.skip_export {
+            for arch in &archs {
+                println!("\nExporting archive {}...", arch);
+                if !export::export_archive(&args.exe, &args.mnf, &args.out, *arch, args.dry_run) {
+                    eprintln!("Archive export reported an error; check output above before continuing.");
+                }
+            }
+            if !args.no_cleanup {
+                println!("\nCleaning up export directory (keeping {} relevant files)...", wanted.len());
+                let (kept, removed) = export::cleanup_export_dir(&args.out, &wanted, args.dry_run);
+                println!("Kept {} files, removed {} files.", kept, removed);
+            } else {
+                println!("\nSkipping cleanup (--no-cleanup).");
+            }
+        } else {
+            println!("\nSkipping export step (--skip-export).");
+        }
+
+        if args.dry_run {
+            println!("\nDry run complete; no file was parsed.");
+            return;
+        }
+
+        let output_dir = Path::new(FINAL_EXPORT_DIR).join(format!("world_0x{:x}", args.world)).join("terrain_lod");
+        let failures = write_lod_meshes(&args.out, &lods, args.cell_size, !args.lod_no_skirts, &output_dir);
+
+        if !args.no_cleanup {
+            match std::fs::remove_dir_all(&args.out) {
+                Ok(()) => println!("Removed temporary export directory '{}'.", args.out),
+                Err(e) => eprintln!("Warning: failed to remove temporary directory '{}': {}", args.out, e),
+            }
+        }
+        println!("\nFinished (lod-only).");
+        if failures > 0 { std::process::exit(1); }
         return;
     }
 
@@ -1124,6 +1481,14 @@ fn main() {
     for c in &cell_pm {
         wanted_indices.insert(c.index);
     }
+    let lod_pm = match manifest::filter_lod_manifest(&args.manifest, args.world) {
+        Ok(v) => v,
+        Err(e) => { eprintln!("Failed to read terrain LOD matches: {}", e); Vec::new() }
+    };
+    println!("Terrain LOD mesh files: {}", lod_pm.len());
+    for l in &lod_pm {
+        wanted_indices.insert(l.index);
+    }
 
     let cell_archs: HashSet<u32> = result.cell_matches.iter().map(|c| c.arch).collect();
     let toc_archs: HashSet<u32> = result.toc_matches.iter().map(|t| t.arch).collect();
@@ -1140,6 +1505,7 @@ fn main() {
         .cloned()
         .collect();
     all_archs.extend(cell_pm.iter().map(|c| c.arch));
+    all_archs.extend(lod_pm.iter().map(|l| l.arch));
     all_archs.sort_unstable();
     all_archs.dedup();
     println!("Archive(s) involved: {:?}", all_archs);
@@ -1494,6 +1860,9 @@ fn main() {
     }
 
     write_placements(&args.out, placement_match.as_ref(), &cell_pm, &output_dir);
+    if !lod_pm.is_empty() {
+        write_lod_meshes(&args.out, &lod_pm, args.cell_size, !args.lod_no_skirts, &output_dir.join("terrain_lod"));
+    }
 
     let total_channels = scalar_channels.len() + vec3_channels.len() + planes4_channels.len();
     if total_channels == 0 {

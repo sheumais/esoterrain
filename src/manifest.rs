@@ -357,6 +357,36 @@ pub fn filter_cell_placement_manifest(manifest_path: &str, world: u32) -> io::Re
     Ok(out)
 }
 
+/// Manifest file type (low 5 bits of Unk1) of the terrain LOD mesh files - entry 0x0A ("terrain-lod") in the world TOC.
+pub const TERRAIN_LOD_TYPE: u32 = 0x0A;
+
+#[derive(Debug, Clone, Copy)]
+pub struct LodMatch {
+    pub index: u32,
+    pub x: u32,
+    pub z: u32,
+    pub arch: u32,
+}
+
+pub fn filter_lod_manifest(manifest_path: &str, world: u32) -> io::Result<Vec<LodMatch>> {
+    let content = std::fs::read_to_string(manifest_path)?;
+    let mut out = Vec::new();
+    for line in content.lines() {
+        let row: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
+        if row.len() < 11 { continue; }
+        let (index, file_index, unk1, arch) = match (parse_int(row[0]), parse_int(row[2]), parse_int(row[3]), parse_int(row[9])) {
+            (Some(i), Some(f), Some(u), Some(a)) => (i as u32, f as u32, u as u32, a as u32),
+            _ => continue,
+        };
+        if (unk1 >> 16) != CELL_HIGH_MARKER
+            || ((unk1 >> 5) & WORLD_MASK) != world
+            || (unk1 & TYPE_MASK) != TERRAIN_LOD_TYPE
+        { continue; }
+        out.push(LodMatch { index, x: file_index >> 16, z: file_index & 0xFFFF, arch });
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SizeEntry {
     pub ty: u32,
@@ -390,4 +420,3 @@ pub fn filter_size_manifest(manifest_path: &str, world: u32) -> io::Result<Vec<S
     }
     Ok(out)
 }
-

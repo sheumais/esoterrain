@@ -144,3 +144,41 @@ pub fn build_csv(
     eprintln!("Note: {} creatures without an appearance, {} without a name.", unresolved, no_name);
     Ok(creatures.spans.len())
 }
+
+/// One row of luts/creatures_lut.csv.
+#[derive(Debug, Clone)]
+pub struct LutRow {
+    pub table_id: u32,
+    pub name_id: u32,
+    pub model: u32,
+    pub skeleton: u32,
+    pub tex: [u32; 3],
+    pub name: String,
+}
+
+/// Find `id` in the creature LUT. Matches the first column (table_id) first; if nothing has that
+/// table_id, falls back to the second column (creature_id / name id), which several creatures can share.
+pub fn find_in_lut(path: &Path, id: u32) -> io::Result<Vec<LutRow>> {
+    let text = fs::read_to_string(path)?;
+    let mut rows = Vec::new();
+    for line in text.lines().skip(1) {
+        let p: Vec<&str> = line.splitn(8, ',').collect();
+        if p.len() < 7 {
+            continue;
+        }
+        let n = |s: &str| s.trim().parse::<u32>().unwrap_or(0);
+        rows.push(LutRow {
+            table_id: n(p[0]),
+            name_id: n(p[1]),
+            model: n(p[2]),
+            skeleton: n(p[3]),
+            tex: [n(p[4]), n(p[5]), n(p[6])],
+            name: p.get(7).map(|s| s.trim().trim_matches('"').to_string()).unwrap_or_default(),
+        });
+    }
+    let by_table: Vec<LutRow> = rows.iter().filter(|r| r.table_id == id).cloned().collect();
+    if !by_table.is_empty() {
+        return Ok(by_table);
+    }
+    Ok(rows.into_iter().filter(|r| r.name_id == id).collect())
+}

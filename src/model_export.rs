@@ -349,23 +349,40 @@ impl<'a> Gr2<'a> {
         Some(String::from_utf8_lossy(&bytes[..n]).into_owned())
     }
     
-    fn material(&self, m: (u32, u32)) -> Option<MatDef> {
+    /// `fill` = diffuse/normal/specular file indexes to use for map slots that carry no texture of their
+    /// own (creature models: their textures live in the creature texture table, not in the .gr2).
+    fn material(&self, m: (u32, u32), fill: Option<[u32; 3]>) -> Option<MatDef> {
         let (s, o) = m;
         let name = self.ptr(s, o).and_then(|p| self.cstr(p)).unwrap_or_default();
         let n = self.u32(s, o + 8)?;
-        if n == 0 || n > 64 {
+        if n > 64 || (n == 0 && fill.is_none()) {
             return None;
         }
-        let maps = self.ptr(s, o + 12)?;
         let mut out = Vec::new();
-        for k in 0..n {
-            let mo = maps.1 + 16 * k;
-            let usage = self.ptr(maps.0, mo).and_then(|p| self.cstr(p)).unwrap_or_default();
-            let Some(sub) = self.ptr(maps.0, mo + 8) else { continue };
-            let Some(tex) = self.ptr(sub.0, sub.1 + 20) else { continue };
-            let Some(fi) = self.u32(tex.0, tex.1 + 92) else { continue };
-            if fi != 0 {
-                out.push(MatMap { usage, file_index: fi });
+        if let Some(maps) = self.ptr(s, o + 12) {
+            for k in 0..n {
+                let mo = maps.1 + 16 * k;
+                let usage = self.ptr(maps.0, mo).and_then(|p| self.cstr(p)).unwrap_or_default();
+                let own = (|| {
+                    let sub = self.ptr(maps.0, mo + 8)?;
+                    let tex = self.ptr(sub.0, sub.1 + 20)?;
+                    self.u32(tex.0, tex.1 + 92)
+                })()
+                .unwrap_or(0);
+                let fi = match (own, fill) {
+                    (0, Some(f)) => role_of(&usage).map(|r| f[r]).unwrap_or(0),
+                    _ => own,
+                };
+                if fi != 0 {
+                    out.push(MatMap { usage, file_index: fi });
+                }
+            }
+        }
+        if let Some(f) = fill {
+            for (r, role) in SLOT_ROLES.iter().enumerate() {
+                if f[r] != 0 && !out.iter().any(|x| x.usage.trim().eq_ignore_ascii_case(role)) {
+                    out.push(MatMap { usage: role.to_string(), file_index: f[r] });
+                }
             }
         }
         if out.is_empty() {
@@ -445,6 +462,10 @@ impl<'a> Gr2<'a> {
 
 
 pub fn parse_materials(blob: &[u8]) -> Option<Vec<MatDef>> {
+    parse_materials_with(blob, None)
+}
+
+pub fn parse_materials_with(blob: &[u8], fill: Option<[u32; 3]>) -> Option<Vec<MatDef>> {
     let g = Gr2::parse(blob)?;
     let (rs, ro) = g.root;
 
@@ -456,7 +477,7 @@ pub fn parse_materials(blob: &[u8]) -> Option<Vec<MatDef>> {
     let mut mats: Vec<((u32, u32), MatDef)> = Vec::new();
     for i in 0..count {
         let Some(mp) = g.ptr(arr.0, arr.1 + 8 * i) else { continue };
-        if let Some(def) = g.material(mp) {
+        if let Some(def) = g.material(mp, fill) {
             mats.push((mp, def));
         }
     }
@@ -1686,6 +1707,15 @@ fn export_model(noesis: &str, model: &Path, dest: &Path) -> Result<(), String> {
 }
 
 pub fn run(model_fi: u32, o: &Options) -> Result<Summary, String> {
+    run_with_textures(model_fi, None, None, "fbx", o)
+}
+
+/// Like `run`, but with `tex` = [diffuse, normal, specular] file indexes for models that don't
+/// embed texture references (creatures). The model is exported with those textures on every material.
+/// `skel` = FileIndex of the creature's skeleton .gr2, copied next to the model as `<index>.gr2`.
+/// When `skel` is given, a skinned `<index>.<rig_ext>` (mesh + bones + weights, written by Noesis; the format
+/// follows the extension, e.g. fbx, glb, dae, smd) is exported as well.
+pub fn run_with_textures(model_fi: u32, tex: Option<[u32; 3]>, skel: Option<u32>, rig_ext: &str, o: &Options) -> Result<Summary, String> {
     let ctx = Ctx { o, prefer_file_index: Cell::new(false) };
 
     let mut want = HashSet::new();
@@ -1710,13 +1740,13 @@ pub fn run(model_fi: u32, o: &Options) -> Result<Summary, String> {
         )
     })?;
     let blob = fs::read(&model_path).map_err(|e| format!("Failed to read '{}': {}", model_path.display(), e))?;
-    if texture_refs(&blob).is_empty() {
+    if tex.is_none() && texture_refs(&blob).is_empty() {
         return Err(format!(
             "No texture reference records found in '{}'. Is this a model .gr2 with the usual header table?",
             model_path.display()
         ));
     }
-    let mats: Vec<MatDef> = match parse_materials(&blob) {
+    let mats: Vec<MatDef> = match parse_materials_with(&blob, tex) {
         Some(m) => m,
         None => {
             eprintln!("  Warning: could not read the material table of this .gr2; guessing material groups from the texture records (3 maps per material).");
@@ -1743,6 +1773,22 @@ pub fn run(model_fi: u32, o: &Options) -> Result<Summary, String> {
     let model_name = copy_into(&model_path, &format!("{}.gr2", model.index), &out_dir)
         .map_err(|e| format!("Failed to copy model: {}", e))?;
     println!("Model -> {}", out_dir.join(&model_name).display());
+
+    if let Some(sk) = skel.filter(|s| *s != 0) {
+        let want: HashSet<u32> = [sk].into_iter().collect();
+        let res = lookup_file_indexes(o.manifest, &want)
+            .map_err(|e| e.to_string())
+            .and_then(|found| pick_row("Skeleton", sk, found.get(&sk)))
+            .and_then(|row| {
+                let src = fetch(&ctx, &row, MODEL_EXTS)
+                    .ok_or_else(|| format!("Index {} was not produced by the exporter", row.index))?;
+                copy_into(&src, &format!("{}.gr2", row.index), &out_dir).map_err(|e| e.to_string())
+            });
+        match res {
+            Ok(name) => println!("Skeleton -> {}", out_dir.join(&name).display()),
+            Err(e) => eprintln!("  Warning: skeleton 0x{:08X} not exported: {}", sk, e),
+        }
+    }
 
     // Noesis' GR2 plugin wants the textures next to the model under fixed role names
     // (diffuse/normal/specular), so it gets a private scratch folder.
@@ -1854,6 +1900,25 @@ pub fn run(model_fi: u32, o: &Options) -> Result<Summary, String> {
             }
         }
         Err(e) => eprintln!("Warning: obj export failed: {}", e),
+    }
+    if skel.is_some() {
+        let n_bones = mesh_infos(&blob).map(|(_, s)| s.len()).unwrap_or(0);
+        println!("  The model file embeds a skeleton of {} bone(s).", n_bones);
+        let fbx_res = plain_abs(&scratch.join(&model_name)).and_then(|src| {
+            let fbx = src.with_extension(rig_ext);
+            export_model(o.noesis, &src, &fbx).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            Ok(fbx)
+        });
+        match fbx_res {
+            Ok(fbx) => {
+                let dest = out_dir.join(format!("{}.{}", model.index, rig_ext));
+                match fs::copy(&fbx, &dest) {
+                    Ok(_) => println!("Rigged {} -> {}", rig_ext, dest.display()),
+                    Err(e) => eprintln!("Warning: could not copy the .{} file: {}", rig_ext, e),
+                }
+            }
+            Err(e) => eprintln!("Warning: .{} export failed (does this Noesis build export that format?): {}", rig_ext, e),
+        }
     }
     let _ = fs::remove_dir_all(&scratch);
 
