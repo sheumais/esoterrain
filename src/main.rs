@@ -1,8 +1,3 @@
-// When exporting, always check the number of files to export.
-// Successfully exported 7380 sub-files in 9.53363 secs!
-// Copied 2 of 2 texture(s) -> ./export\terrain_textures
-// This ^^ should NEVER happen. Why would I export 8000 fils just to copy two of them and trash the rest???
-// If there is <10 files in an archive, just export each one of them individually.
 mod export;
 mod landfile;
 mod lodmesh;

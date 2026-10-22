@@ -10,6 +10,9 @@ https://github.com/uesp/uesp-esoapps/blob/master/EsoLand/EsoLand/EsoLand.cpp
 
 https://knockout.chat/thread/12222/
 
+https://en.uesp.net/wiki/ESO_Mod:DAT_File_Contents
+^ holy grail of information 
+
 ![Northern Elsweyr Render](northern_elsweyr_colour.png)
 
 
@@ -19,7 +22,7 @@ Also has functionality for exporting some file tables, like every furniture mode
 
 generate mnf with (as documented in esoextractdata readme)
 ```shell
-EsoExtractData.exe "C:\Program Files (x86)\Steam\steamapps\common\Zenimax Online\The Elder Scrolls Online\depot\eso.mnf" .\export\ -m eso_mnf.csv
+./EsoExtractData.exe "C:\Program Files (x86)\Steam\steamapps\common\Zenimax Online\The Elder Scrolls Online\depot\eso.mnf" .\export\ -m eso_mnf.csv -k
 ```
 
 ![Rockgrove Render](rockgrove.png)
