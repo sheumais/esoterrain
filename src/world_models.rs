@@ -5,8 +5,10 @@
 //!     model_id,x,y,z[,rx,ry,rz]
 //!
 //! * `model_id` is `model_type_id` (== MNF FileIndex), decimal.
-//! * Source is the world's primary placement file only. The per-cell placement files are just the same data
-//!   split up for streaming around the player, so they are ignored here.
+//! * Source is the world's two per-world placement files: the primary one (manifest type 0x02) and the secondary one
+//!   (type 0x01, same record layout, different models), merged into one CSV. The secondary file is optional: if its
+//!   archive is not available the world is still written from the primary file alone. The per-cell placement files
+//!   are not read here.
 //! * Positions are rounded to 0.01, rotations to 0.0001 rad, and written without trailing zeros
 //!   ("1234.5", not "1234.50").
 //! * Rows are sorted (model, x, y, z, rot), so a patch that adds/removes one instance changes exactly one
@@ -247,17 +249,20 @@ pub fn run(a: &RunArgs) -> Result<(), String> {
 
     let available = |arch: u32| (arch as u64) < (manifest::UNAVAILABLE_ARCHIVE_THRESHOLD as u64);
 
+    // One pass over the manifest for both placement types (instead of re-reading it once per world).
+    let placements = manifest::filter_placement_manifest_all(
+        a.manifest,
+        &[manifest::PLACEMENT_TYPE, manifest::PLACEMENT_TYPE_SECONDARY],
+    )
+    .map_err(|e| format!("Failed to read manifest '{}': {}", a.manifest, e))?;
+
     let mut by_arch: BTreeMap<u32, Vec<Job>> = BTreeMap::new();
     let mut states: HashMap<u32, WorldState> = HashMap::new();
     let (mut no_placement, mut unavailable) = (0usize, 0usize);
+    let (mut with_secondary, mut secondary_unavailable) = (0usize, 0usize);
 
-    for (n, &w) in worlds.iter().enumerate() {
-        if n > 0 && n % 100 == 0 {
-            println!("  ...{}/{}", n, worlds.len());
-        }
-        let pm = manifest::filter_placement_manifest(a.manifest, w)
-            .map_err(|e| format!("Failed to read manifest '{}': {}", a.manifest, e))?;
-        let Some(p) = pm else {
+    for &w in &worlds {
+        let Some(p) = placements.get(&(w, manifest::PLACEMENT_TYPE)) else {
             no_placement += 1;
             continue;
         };
@@ -265,12 +270,26 @@ pub fn run(a: &RunArgs) -> Result<(), String> {
             unavailable += 1;
             continue;
         }
-        states.insert(w, WorldState { remaining: 1, rows: Vec::new(), failed: false });
+        let mut remaining = 1;
         by_arch.entry(p.arch).or_default().push(Job { world: w, index: p.index });
+        match placements.get(&(w, manifest::PLACEMENT_TYPE_SECONDARY)) {
+            Some(s) if available(s.arch) => {
+                remaining += 1;
+                with_secondary += 1;
+                by_arch.entry(s.arch).or_default().push(Job { world: w, index: s.index });
+            }
+            Some(_) => secondary_unavailable += 1,
+            None => {}
+        }
+        states.insert(w, WorldState { remaining, rows: Vec::new(), failed: false });
     }
     println!(
         "{} world(s) to process across {} archive(s); {} without placement files, {} skipped (archive not available).",
         states.len(), by_arch.len(), no_placement, unavailable
+    );
+    println!(
+        "{} world(s) also have a secondary placement file; {} more have one in an unavailable archive (written from the primary file only).",
+        with_secondary, secondary_unavailable
     );
 
     let mut tally = Tally::default();

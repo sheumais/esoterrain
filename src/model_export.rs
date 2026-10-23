@@ -24,7 +24,7 @@
 //!
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -1992,6 +1992,109 @@ fn prefetch(ids: &[u32], o: &Options) -> Result<(), String> {
 }
 
 const SMALL_BATCH: usize = 10;
+
+/// Name of the first mesh in a model .gr2 that has one (the same name Noesis uses for the OBJ group).
+pub fn mesh_name(blob: &[u8]) -> Option<String> {
+    let g = Gr2::parse(blob)?;
+    let (rs, ro) = g.root;
+    let mc = g.u32(rs, ro + 84)?;
+    let marr = g.ptr(rs, ro + 88)?;
+    for i in 0..mc.min(4096) {
+        let Some(mesh) = g.ptr(marr.0, marr.1 + 8 * i) else { continue };
+        if let Some(n) = g.ptr(mesh.0, mesh.1).and_then(|p| g.cstr(p)) {
+            let n = n.trim();
+            if !n.is_empty() {
+                return Some(n.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Mesh name of each model in `ids` (MNF FileIndexes), read from the model's .gr2. Like `run_batch`, 10 or more
+/// models are fetched by exporting each whole archive once (then pruned to the wanted files); fewer are fetched
+/// file by file. Models that can't be exported or read are simply left out of the result. Needs no Noesis.
+pub fn mesh_names(ids: &[u32], o: &Options) -> HashMap<u32, String> {
+    let mut out = HashMap::new();
+    if o.dry_run || ids.is_empty() {
+        return out;
+    }
+    let want: HashSet<u32> = ids.iter().copied().collect();
+    let rows = match lookup_file_indexes(o.manifest, &want) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to read manifest '{}': {}", o.manifest, e);
+            return out;
+        }
+    };
+    let mut by_arch: BTreeMap<u32, Vec<(u32, MnfRow)>> = BTreeMap::new();
+    let mut sorted: Vec<u32> = want.iter().copied().collect();
+    sorted.sort_unstable();
+    let mut not_in_manifest = 0usize;
+    for id in sorted {
+        match rows.get(&id).and_then(|v| v.first()) {
+            Some(r) => by_arch.entry(r.arch).or_default().push((id, r.clone())),
+            None => not_in_manifest += 1,
+        }
+    }
+    let total: usize = by_arch.values().map(Vec::len).sum();
+    let whole_archives = total >= SMALL_BATCH && !o.skip_export;
+    if whole_archives {
+        println!("{} model(s) in {} archive(s): exporting whole archives.", total, by_arch.len());
+    } else if !o.skip_export {
+        println!("{} model(s): exporting individual files instead of whole archives.", total);
+    }
+
+    let inner = Options {
+        manifest: o.manifest,
+        exe: o.exe,
+        mnf: o.mnf,
+        temp_dir: o.temp_dir,
+        out_root: o.out_root,
+        dry_run: false,
+        skip_export: o.skip_export || whole_archives,
+        keep_temp: true,
+        noesis: o.noesis,
+    };
+    let ctx = Ctx { o: &inner, prefer_file_index: Cell::new(false) };
+    let mut unreadable = 0usize;
+    for (k, (arch, list)) in by_arch.iter().enumerate() {
+        if whole_archives {
+            println!("\n[{}/{}] Archive {}: {} model(s)", k + 1, by_arch.len(), arch, list.len());
+            if !export::export_archive(o.exe, o.mnf, o.temp_dir, *arch, false) {
+                eprintln!("  Archive {} export reported an error; its models may stay unnamed.", arch);
+            }
+            let keep: HashSet<u32> = list.iter().map(|(_, r)| r.index).collect();
+            let (kept, removed) = export::cleanup_export_dir(o.temp_dir, &keep, false);
+            println!("  Pruned archive {}: kept {} files, removed {}.", arch, kept, removed);
+            invalidate_index();
+        }
+        for (id, row) in list {
+            let name = fetch(&ctx, row, MODEL_EXTS)
+                .and_then(|p| fs::read(p).ok())
+                .and_then(|blob| mesh_name(&blob));
+            match name {
+                Some(n) => {
+                    out.insert(*id, n);
+                }
+                None => unreadable += 1,
+            }
+        }
+        if whole_archives && !o.keep_temp {
+            invalidate_index();
+            let _ = fs::remove_dir_all(o.temp_dir);
+        }
+    }
+    if !o.keep_temp && !o.skip_export {
+        invalidate_index();
+        let _ = fs::remove_dir_all(o.temp_dir);
+    }
+    println!(
+        "Mesh names: {} of {} model(s) named ({} not in the manifest, {} without a readable mesh name).",
+        out.len(), ids.len(), not_in_manifest, unreadable
+    );
+    out
+}
 
 pub fn run_batch(ids: &[u32], o: &Options) -> Vec<(u32, Result<Summary, String>)> {
     let mut prefetched = false;

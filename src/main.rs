@@ -16,6 +16,7 @@ mod scene_export;
 mod keep_export;
 mod world_models;
 mod terrain_textures;
+mod model_summary;
 
 use landfile::{fixed_channel_range, save_rgb_from_channels, LandFile, RawBigImage, RawTile};
 use manifest::filter_manifest;
@@ -76,6 +77,7 @@ struct Args {
     lut_worlds: Vec<u32>,
     lut_rot: bool,
     all_luts: bool,
+    model_summary: bool,
     terrain_textures: bool,
 }
 
@@ -246,6 +248,7 @@ Options:\n  \
 --terrain-textures  Parse the terrain texture table (file id 0x29), export every texture it references into export/terrain_textures/\n                       and write luts/terrain_textures_lut.csv. Textures already exported are skipped, so it can be re-run/resumed.\n                       Archives needing fewer than 10 of the textures are exported file-by-file instead of as a whole archive\n \
 --world-model-lut    For EVERY world: export its placement files and write luts/worlds/world_0x<id>.csv\n  \
                        (model_id,x,y,z; sorted; from the world placement file only). Each archive is exported once.\n \
+--model-summary      Read every luts/worlds/world_0x<id>.csv and write luts/model_usage_summary.csv (each model: total count, worlds it appears in)\n                       and luts/model_manifest_entries.csv (the raw manifest line(s) for each model). Also runs automatically after --world-model-lut / --all-luts\n \
 --worlds <list>      With --world-model-lut: only these worlds (comma-separated, hex or decimal)\n \
 --with-rot           With --world-model-lut: also write rx,ry,rz columns\n \
 --all-luts           Write every LUT (run once per patch): the world, model, creature, item and keep LUTs share one archive export, then\n                       --world-model-lut runs. --exe/--mnf/--manifest/--out/--worlds/--with-rot/--dry-run/--no-cleanup apply\n \
@@ -295,6 +298,7 @@ fn parse_args() -> Args {
     let mut lut_worlds: Vec<u32> = Vec::new();
     let mut lut_rot = false;
     let mut all_luts = false;
+    let mut model_summary = false;
     let mut terrain_textures = false;
 
     let mut i = 0;
@@ -338,6 +342,7 @@ fn parse_args() -> Args {
             "--world-model-lut" => world_model_lut = true,
             "--with-rot" => lut_rot = true,
             "--all-luts" => all_luts = true,
+            "--model-summary" => model_summary = true,
             "--terrain-textures" => terrain_textures = true,
             "--worlds" => {
                 i += 1;
@@ -420,7 +425,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    let world = if !model_fis.is_empty() || !creature_ids.is_empty() || !scene.is_empty() || list_worlds || world_lut || model_list || creature_list || item_list || keep_list || keeps || world_model_lut || all_luts || terrain_textures {
+    let world = if !model_fis.is_empty() || !creature_ids.is_empty() || !scene.is_empty() || list_worlds || world_lut || model_list || creature_list || item_list || keep_list || keeps || world_model_lut || all_luts || model_summary || terrain_textures {
         0
     } else {
         let world_str: &String = match positional.len() {
@@ -476,6 +481,7 @@ fn parse_args() -> Args {
         lut_worlds,
         lut_rot,
         all_luts,
+        model_summary,
         terrain_textures,
     }
 }
@@ -553,7 +559,8 @@ fn build_creature_lut(found: &[manifest::TableMatch], dir: &str) -> Result<(), S
 }
 
 /// `found` = [materials, part materials, item visual templates, item names]
-fn build_item_lut(found: &[manifest::TableMatch], dir: &str) -> Result<(), String> {
+fn build_item_lut(found: &[manifest::TableMatch], args: &Args) -> Result<(), String> {
+    let dir = args.out.as_str();
     let materials = load_table(&found[0], "Material", dir)?;
     let part_mats = load_table(&found[1], "Part material", dir)?;
     let templates = load_table(&found[2], "Item visual template", dir)?;
@@ -564,7 +571,24 @@ fn build_item_lut(found: &[manifest::TableMatch], dir: &str) -> Result<(), Strin
     println!("Loaded {} item names.", names.len());
     std::fs::create_dir_all(LUT_DIR).map_err(|e| format!("failed to create luts dir: {}", e))?;
     let out_path = Path::new(LUT_DIR).join("items_lut.csv");
-    let n = items::build_csv(&templates, &part_mats, &materials, &name_tbl, &names, &out_path)
+    // Parts with no lang name get the mesh name of their model instead; the models are exported into a subfolder of
+    // the working dir (it is removed together with it).
+    let model_dir = Path::new(dir).join("item_models").to_string_lossy().into_owned();
+    let mesh_names = |ids: &[u32]| -> HashMap<u32, String> {
+        let opts = model_export::Options {
+            manifest: &args.manifest,
+            exe: &args.exe,
+            mnf: &args.mnf,
+            temp_dir: &model_dir,
+            out_root: Path::new(LUT_DIR),
+            dry_run: args.dry_run,
+            skip_export: args.skip_export,
+            keep_temp: args.no_cleanup,
+            noesis: &args.noesis,
+        };
+        model_export::mesh_names(ids, &opts)
+    };
+    let n = items::build_csv(&templates, &part_mats, &materials, &name_tbl, &names, &mesh_names, &out_path)
         .map_err(|e| format!("Error writing '{}': {}", out_path.display(), e))?;
     println!("Wrote {} item parts -> {}", n, out_path.display());
     Ok(())
@@ -638,7 +662,7 @@ fn run_core_luts(args: &Args) -> Result<(), String> {
     if let Err(e) = build_world_lut(&world, &args.out) { errors.push(e); }
     if let Err(e) = build_model_lut(&model_m, &args.out) { errors.push(e); }
     if let Err(e) = build_creature_lut(&creature_set, &args.out) { errors.push(e); }
-    if let Err(e) = build_item_lut(&item_set, &args.out) { errors.push(e); }
+    if let Err(e) = build_item_lut(&item_set, args) { errors.push(e); }
     if let Err(e) = build_keep_lut(&keep_m, &args.out) { errors.push(e); }
 
     if !args.no_cleanup { let _ = std::fs::remove_dir_all(&args.out); }
@@ -659,7 +683,14 @@ fn run_world_model_lut(args: &Args) -> Result<(), String> {
         skip_export: args.skip_export,
         keep_temp: args.no_cleanup,
     };
-    world_models::run(&a)
+    world_models::run(&a)?;
+    if args.dry_run { return Ok(()); }
+    run_model_summary(args)
+}
+
+/// Summarise every luts/worlds/*.csv (model usage + the manifest line for each model).
+fn run_model_summary(args: &Args) -> Result<(), String> {
+    model_summary::run(&Path::new(LUT_DIR).join("worlds"), &args.manifest, Path::new(LUT_DIR))
 }
 
 /// Archives that need fewer textures than this are exported file-by-file instead of dumping the whole archive.
@@ -927,6 +958,11 @@ fn main() {
         }
         eprintln!("\nFailed: {}", failed.join(", "));
         std::process::exit(1);
+    }
+
+    if args.model_summary {
+        if let Err(e) = run_model_summary(&args) { eprintln!("{}", e); std::process::exit(1); }
+        return;
     }
 
     if args.world_model_lut {
@@ -1387,7 +1423,7 @@ fn main() {
         }
         if args.dry_run { println!("\nDry run complete."); return; }
 
-        if let Err(e) = build_item_lut(&found, &args.out) { eprintln!("{}", e); std::process::exit(1); }
+        if let Err(e) = build_item_lut(&found, &args) { eprintln!("{}", e); std::process::exit(1); }
         if !args.no_cleanup { let _ = std::fs::remove_dir_all(&args.out); }
         return;
     }
