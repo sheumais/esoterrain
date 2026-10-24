@@ -174,3 +174,66 @@ pub fn build_csv(
     );
     Ok(rows.len())
 }
+/// One row of luts/items_lut.csv (`template_id,part,model,diffuse,tint,normal,specular,name,model2`).
+#[derive(Debug, Clone)]
+pub struct LutRow {
+    pub template_id: u32,
+    pub part: u32,
+    pub model: u32,
+    /// Second model id of the part (0 = none).
+    pub model2: u32,
+    pub diffuse: u32,
+    pub tint: u32,
+    pub normal: u32,
+    pub specular: u32,
+    pub name: String,
+}
+
+/// Split one CSV line, honouring double quotes ("" is an escaped quote). Names can contain commas.
+fn split_csv(line: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut it = line.chars().peekable();
+    while let Some(c) = it.next() {
+        match c {
+            '"' if quoted && it.peek() == Some(&'"') => {
+                cur.push('"');
+                it.next();
+            }
+            '"' => quoted = !quoted,
+            ',' if !quoted => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    out.push(cur);
+    out
+}
+
+/// Every part (row) of item template `id` in the item LUT, in file (part) order. Empty if the template isn't there.
+pub fn find_in_lut(path: &Path, id: u32) -> io::Result<Vec<LutRow>> {
+    let text = fs::read_to_string(path)?;
+    let mut rows = Vec::new();
+    for line in text.lines().skip(1) {
+        let p = split_csv(line);
+        if p.len() < 7 {
+            continue;
+        }
+        let n = |s: &str| s.trim().parse::<u32>().unwrap_or(0);
+        if n(&p[0]) != id {
+            continue;
+        }
+        rows.push(LutRow {
+            template_id: id,
+            part: n(&p[1]),
+            model: n(&p[2]),
+            diffuse: n(&p[3]),
+            tint: n(&p[4]),
+            normal: n(&p[5]),
+            specular: n(&p[6]),
+            name: p.get(7).map(|s| s.trim().to_string()).unwrap_or_default(),
+            model2: p.get(8).map(|s| n(s)).unwrap_or(0),
+        });
+    }
+    Ok(rows)
+}

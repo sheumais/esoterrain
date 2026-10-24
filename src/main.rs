@@ -17,6 +17,7 @@ mod keep_export;
 mod world_models;
 mod terrain_textures;
 mod model_summary;
+mod terrain_layers;
 
 use landfile::{fixed_channel_range, save_rgb_from_channels, LandFile, RawBigImage, RawTile};
 use manifest::filter_manifest;
@@ -61,6 +62,7 @@ struct Args {
     size_scale: u32,
     model_fis: Vec<u32>,
     creature_ids: Vec<u32>,
+    item_models: Vec<u32>,
     rig_format: String,
     noesis: String,
     scene: Vec<String>,
@@ -79,6 +81,9 @@ struct Args {
     all_luts: bool,
     model_summary: bool,
     terrain_textures: bool,
+    terrain_layers: Option<u32>,
+    terrain_layer_only: Vec<(u32, u32)>, // (kind, layer id) pairs for --terrain-layer-id
+    terrain_layer_split: Option<Vec<u32>>, // --terrain-layer-split: kinds to write one file per id for (empty = all kinds)
 }
 
 fn parse_int_arg(s: &str) -> u32 {
@@ -225,6 +230,7 @@ Options:\n  \
 --no-auto-variants  Don't split overlapping meshes (alternative versions) into separate OBJs; by default every\n                       model with such meshes is exported once per version (<index>_<mesh>.obj)\n  \
 --model <FileIndex>  Export a model + textures + .obj/.mtl into export/models/ (one flat folder).\n                       Repeat the flag or use commas for several: --model 0x15b253,0x15b254\n  \
 --creature <id>      Export a creature's model + diffuse/normal/specular textures + .obj/.mtl into export/models/.\n                       <id> is a table_id (first column) or creature_id (second column) of luts/creatures_lut.csv;\n                       repeat the flag or use commas for several. Run --creature-lut first to build the CSV.\n  \
+--item-model <id>    Export an item's model(s) + diffuse/normal/specular textures + .obj/.mtl into export/models/.\n                       <id> is a template_id (first column) of luts/items_lut.csv; every part of the item is exported\n                       (plus a part's second model, if it has one). Repeat the flag or use commas for several.\n                       Run --item-lut first. Files are extracted one by one, never as whole archives.\n  \
 --rig-format <ext>   With --creature: format of the skinned (mesh + skeleton + weights) export written by Noesis,\n                       by extension (default fbx; others to try: glb, dae, smd)\n  \
 --noesis <path>      Path to Noesis64.exe (default: {})\n  \
 --scene <paths>      Export every model used by placement JSON file(s) or folder(s) (comma-separated or repeated;\n                       world placement.json and cell_x#_z#.json both work), then write a Blender script that\n                       places them as collection-instance references into export/scenes/\n  \
@@ -246,6 +252,8 @@ Options:\n  \
 --keep-lut           Export the keeps table (0x5a) and write luts/keeps_lut.csv\n \
 --item-lut           Export the item visual templates (0x58), part materials (0x50), materials (0x05) and item names (0x171) tables and write luts/items_lut.csv\n \
 --terrain-textures  Parse the terrain texture table (file id 0x29), export every texture it references into export/terrain_textures/\n                       and write luts/terrain_textures_lut.csv. Textures already exported are skipped, so it can be re-run/resumed.\n                       Archives needing fewer than 10 of the textures are exported file-by-file instead of as a whole archive\n \
+--terrain-layers <world>  Export the terrain layer table (0x44) and stitch one world into export/world_0x<id>/terrain_layers/:\n                       one k<kind>_ids.png per kind (colour = layer id) plus k<kind>_legend.csv; kind 2 is the zone map and its legend has the zone names\n \
+--terrain-layer-split <kinds>  With --terrain-layers: write EVERY layer id of the given kinds to its own file, nothing drawn over anything else.\n                       <kinds> = 6, 6,2 or all. Writes k<kind>_layers/id_<id>.png (white = cells where that id is set; same canvas as the full images)\n                       plus k<kind>_layers/index.csv (layer_id,r,g,b,pixels,blocks,x0,y0,x1,y1,name). The viewer can load these folders.\n--terrain-layer-id <kind>:<id>  With --terrain-layers: export ONLY that layer value instead of every id. Writes k<kind>_id<id>.png\n                       (white = cells where that id is set, black = not) on the same canvas as the full images, e.g. --terrain-layers 0x47f --terrain-layer-id 6:3732\n                       Several: 6:3732,6:3771 (comma-separated or repeat the flag). The kind may be written 6 or k6.\n \
 --world-model-lut    For EVERY world: export its placement files and write luts/worlds/world_0x<id>.csv\n  \
                        (model_id,x,y,z; sorted; from the world placement file only). Each archive is exported once.\n \
 --model-summary      Read every luts/worlds/world_0x<id>.csv and write luts/model_usage_summary.csv (each model: total count, worlds it appears in)\n                       and luts/model_manifest_entries.csv (the raw manifest line(s) for each model). Also runs automatically after --world-model-lut / --all-luts\n \
@@ -282,6 +290,7 @@ fn parse_args() -> Args {
     let mut size_scale: u32 = 16;
     let mut model_fis: Vec<u32> = Vec::new();
     let mut creature_ids: Vec<u32> = Vec::new();
+    let mut item_models: Vec<u32> = Vec::new();
     let mut rig_format = String::from("fbx");
     let mut noesis = NOESIS.to_string();
     let mut scene: Vec<String> = Vec::new();
@@ -300,6 +309,9 @@ fn parse_args() -> Args {
     let mut all_luts = false;
     let mut model_summary = false;
     let mut terrain_textures = false;
+    let mut tl_world: Option<u32> = None;
+    let mut tl_only: Vec<(u32, u32)> = Vec::new();
+    let mut tl_split: Option<Vec<u32>> = None;
 
     let mut i = 0;
     while i < raw.len() {
@@ -344,6 +356,25 @@ fn parse_args() -> Args {
             "--all-luts" => all_luts = true,
             "--model-summary" => model_summary = true,
             "--terrain-textures" => terrain_textures = true,
+            "--terrain-layers" => { i += 1; tl_world = Some(parse_int_arg(raw.get(i).expect("--terrain-layers needs a world id"))); }
+            "--terrain-layer-split" => {
+                i += 1;
+                let val = raw.get(i).expect("--terrain-layer-split needs a kind list (6 or 6,2) or 'all'");
+                let kinds = tl_split.get_or_insert_with(Vec::new);
+                for part in val.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    if part.eq_ignore_ascii_case("all") { continue; }
+                    kinds.push(parse_int_arg(part.trim_start_matches(|c| c == 'k' || c == 'K')));
+                }
+            }
+            "--terrain-layer-id" => {
+                i += 1;
+                let val = raw.get(i).expect("--terrain-layer-id needs <kind>:<id>[,<kind>:<id>...]");
+                for part in val.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    let (k, id) = part.split_once(':').unwrap_or_else(|| panic!("--terrain-layer-id expects <kind>:<id>, got '{}'", part));
+                    let k = k.trim().trim_start_matches(|c| c == 'k' || c == 'K');
+                    tl_only.push((parse_int_arg(k), parse_int_arg(id)));
+                }
+            }
             "--worlds" => {
                 i += 1;
                 let val = raw.get(i).expect("--worlds needs a value");
@@ -369,6 +400,13 @@ fn parse_args() -> Args {
                 let val = raw.get(i).expect("--creature needs an id");
                 for part in val.split(',').map(str::trim).filter(|p| !p.is_empty()) {
                     creature_ids.push(parse_int_arg(part));
+                }
+            }
+            "--item-model" => {
+                i += 1;
+                let val = raw.get(i).expect("--item-model needs a template id");
+                for part in val.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+                    item_models.push(parse_int_arg(part));
                 }
             }
             "--rig-format" => {
@@ -425,7 +463,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    let world = if !model_fis.is_empty() || !creature_ids.is_empty() || !scene.is_empty() || list_worlds || world_lut || model_list || creature_list || item_list || keep_list || keeps || world_model_lut || all_luts || model_summary || terrain_textures {
+    let world = if !model_fis.is_empty() || !creature_ids.is_empty() || !item_models.is_empty() || !scene.is_empty() || list_worlds || world_lut || model_list || creature_list || item_list || keep_list || keeps || world_model_lut || all_luts || model_summary || terrain_textures || tl_world.is_some() {
         0
     } else {
         let world_str: &String = match positional.len() {
@@ -465,6 +503,7 @@ fn parse_args() -> Args {
         size_scale,
         model_fis,
         creature_ids,
+        item_models,
         rig_format,
         noesis,
         scene,
@@ -483,6 +522,9 @@ fn parse_args() -> Args {
         all_luts,
         model_summary,
         terrain_textures,
+        terrain_layers: tl_world,
+        terrain_layer_only: tl_only,
+        terrain_layer_split: tl_split,
     }
 }
 
@@ -746,6 +788,44 @@ fn export_texture_individually(args: &Args, row: &model_export::MnfRow, dest: &P
 }
 
 /// Parse the terrain texture table (file id 0x29), export every texture it references and write the LUT.
+/// Stitch the terrain layer masks (table 0x44) of one world into export/world_0x<id>/terrain_layers/.
+/// Zone names for the kind-2 layer come from en.lang.csv, which is exported together with the table.
+fn run_terrain_layers(args: &Args, world: u32) -> Result<(), String> {
+    let table = table_match(args, terrain_layers::TERRAIN_LAYER_FILE_INDEX, "terrain layer table")?;
+
+    // 1. export the table (tables are only available through the combined archive export)
+    if !args.skip_export {
+        println!("\nExporting archive {} (terrain layer table)...", table.arch);
+        if !export::export_archive_combined(&args.exe, &args.mnf, &args.out, table.arch, args.dry_run) {
+            eprintln!("Archive export reported an error; check output above before continuing.");
+        }
+        // en.lang.csv comes with the world table's archive (see --world-lut)
+        let world_m = table_match(args, manifest::WORLD_LUT_FILE_INDEX, "world table")?;
+        if world_m.arch != table.arch {
+            println!("\nExporting archive {} (en.lang.csv)...", world_m.arch);
+            if !export::export_archive_combined(&args.exe, &args.mnf, &args.out, world_m.arch, args.dry_run) {
+                eprintln!("Archive export reported an error; check output above before continuing.");
+            }
+        }
+        if !args.no_cleanup {
+            let keep: HashSet<u32> = std::iter::once(table.index).collect();
+            let (kept, removed) = export::cleanup_export_dir_keeping(&args.out, &keep, &["en.lang.csv"], args.dry_run);
+            println!("Kept {} files, removed {} files.", kept, removed);
+        }
+    }
+    if args.dry_run { println!("\nDry run complete."); return Ok(()); }
+
+    // 2. stitch
+    let entry = find_uncompressed(&args.out, table.index)
+        .ok_or_else(|| format!("Terrain layer table '{}_Uncompressed' not found under '{}'.", table.index, args.out))?;
+    let lang = find_lang(&args.out);
+    let out_dir = Path::new(FINAL_EXPORT_DIR).join(format!("world_0x{:x}", world)).join("terrain_layers");
+    terrain_layers::run(&entry, lang.as_deref(), world, &out_dir, &args.terrain_layer_only, args.terrain_layer_split.as_deref())?;
+
+    if !args.no_cleanup { let _ = std::fs::remove_dir_all(&args.out); }
+    Ok(())
+}
+
 fn run_terrain_textures(args: &Args) -> Result<(), String> {
     use std::collections::{BTreeMap, BTreeSet};
 
@@ -975,6 +1055,11 @@ fn main() {
         return;
     }
 
+    if let Some(world) = args.terrain_layers {
+        if let Err(e) = run_terrain_layers(&args, world) { eprintln!("{}", e); std::process::exit(1); }
+        return;
+    }
+
     if !args.scene.is_empty() {
         let models_dir = Path::new(FINAL_EXPORT_DIR).join("models");
         let scenes_dir = Path::new(FINAL_EXPORT_DIR).join("scenes");
@@ -1042,6 +1127,67 @@ fn main() {
             match model_export::run_with_textures(row.model, Some(row.tex), Some(row.skeleton), &args.rig_format, &opts) {
                 Ok(s) => println!("\nFinished creature {}. {} texture(s) exported, {} missing -> {}", row.table_id, s.textures_found, s.textures_missing, s.out_dir.display()),
                 Err(e) => { eprintln!("{}", e); failed += 1; }
+            }
+        }
+        if failed > 0 { std::process::exit(1); }
+        return;
+    }
+
+    if !args.item_models.is_empty() {
+        let lut = Path::new(LUT_DIR).join("items_lut.csv");
+        let models_dir = Path::new(FINAL_EXPORT_DIR).join("models");
+        // keep_temp: the parts of an item share textures, so the temp dir is only wiped once at the end.
+        // Every file is fetched individually (`-f`); there is deliberately no whole-archive path here.
+        let opts = model_export::Options {
+            manifest: &args.manifest,
+            exe: &args.exe,
+            mnf: &args.mnf,
+            temp_dir: &args.out,
+            out_root: &models_dir,
+            dry_run: args.dry_run,
+            skip_export: args.skip_export,
+            keep_temp: true,
+            noesis: &args.noesis,
+        };
+        let mut failed = 0usize;
+        let mut done: HashSet<u32> = HashSet::new();
+        for id in &args.item_models {
+            let rows = match items::find_in_lut(&lut, *id) {
+                Ok(r) => r,
+                Err(e) => { eprintln!("Cannot read '{}': {} (run --item-lut first)", lut.display(), e); std::process::exit(1); }
+            };
+            if rows.is_empty() {
+                eprintln!("Item template {} not found in '{}'.", id, lut.display());
+                failed += 1;
+                continue;
+            }
+            let name = rows.iter().map(|r| r.name.as_str()).find(|n| !n.is_empty()).unwrap_or("");
+            println!("\n=== Item template {} '{}': {} part(s) ===", id, name, rows.len());
+            for r in &rows {
+                let tex = [r.diffuse, r.normal, r.specular];
+                if r.tint != 0 {
+                    println!("  (part {}: tint map {} is not exported)", r.part, r.tint);
+                }
+                // No texture ids in the LUT (unresolved material) -> fall back to whatever the model embeds.
+                let fill = if tex.iter().all(|t| *t == 0) { None } else { Some(tex) };
+                let mut models = vec![r.model];
+                if r.model2 != 0 { models.push(r.model2); }
+                for m in models {
+                    if !done.insert(m) {
+                        println!("  part {}: model {} already exported, skipping.", r.part, m);
+                        continue;
+                    }
+                    println!("\n--- part {} model {} (textures {}/{}/{}) ---", r.part, m, r.diffuse, r.normal, r.specular);
+                    match model_export::run_with_textures(m, fill, None, &args.rig_format, &opts) {
+                        Ok(s) => println!("Finished model {}. {} texture(s) exported, {} missing -> {}", m, s.textures_found, s.textures_missing, s.out_dir.display()),
+                        Err(e) => { eprintln!("{}", e); failed += 1; }
+                    }
+                }
+            }
+        }
+        if !args.no_cleanup && !args.skip_export && !args.dry_run {
+            if let Err(e) = std::fs::remove_dir_all(&args.out) {
+                eprintln!("Warning: failed to remove temporary directory '{}': {}", args.out, e);
             }
         }
         if failed > 0 { std::process::exit(1); }
