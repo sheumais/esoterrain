@@ -58,7 +58,7 @@
             .kindRow .ct { color: var(--muted); }
             .kindRow input[type="range"] { width: 70px; }
 
-            #legendList { max-height: 300px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
+            #legendList, #splitList { max-height: 300px; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
             .legRow { display: flex; align-items: center; gap: 8px; font-size: 12px; padding: 3px 5px; border-radius: 4px; cursor: pointer; }
             .legRow:hover { background: var(--panel-2); }
             .legRow.sel { background: rgba(232,163,61,0.16); outline: 1px solid var(--accent-2); }
@@ -92,7 +92,7 @@
 
             <div class="drop" id="drop">
                 Drop the <strong>terrain_layers folder</strong> here<br>
-                <span style="font-size:11px;">(k&lt;kind&gt;_ids.png + k&lt;kind&gt;_legend.csv from --terrain-layers)</span>
+                <span style="font-size:11px;">(k&lt;kind&gt;_ids.png + k&lt;kind&gt;_legend.csv from --terrain-layers,<br>and the k&lt;kind&gt;_layers folders from --terrain-layer-split)</span>
                 <div class="btns">
                     <button id="btnFolder">Add folder</button>
                     <button id="btnFiles">Add files</button>
@@ -112,6 +112,18 @@
             <div class="section" id="kindsBox" style="display:none;">
                 <div class="sub" style="margin:0;">Kinds (click a name to use its legend; slider = opacity)</div>
                 <div id="kindList"></div>
+            </div>
+
+            <div class="section" id="splitBox" style="display:none;">
+                <div class="sub" style="margin:0;">Split layers (one file per id, drawn separately so overlaps show)</div>
+                <div class="row">
+                    <select id="splitKind"></select>
+                    <span><button id="splitAll">Show</button> <button id="splitNone">Hide all</button></span>
+                </div>
+                <div class="row"><label class="sub" style="margin:0;">Opacity of each id</label><input type="range" id="splitOp" min="5" max="100" value="60"></div>
+                <input type="text" id="splitFilter" placeholder="Filter by id or name...">
+                <div id="splitList"></div>
+                <div class="stat">Tick ids to show them. "Show" ticks everything matching the filter. Hovering the map lists every shown id under the cursor.</div>
             </div>
 
             <div class="section" id="controls" style="display:none;">
@@ -232,25 +244,57 @@
                 return { w: bmp.width, h: bmp.height, data: g.getImageData(0, 0, bmp.width, bmp.height).data };
             }
 
+            const rxIds = /^k(\d+)_(ids\.png|legend\.csv)$/i;
+            const rxSplitFile = /^(?:id_(\d+)\.png|(index)\.csv)$/i;
+            const rxLayersDir = /^k(\d+)_layers$/i;
+            const pathOf = f => f._path || f.webkitRelativePath || f.name;
+            // ids/legend files, or files of a k<kind>_layers folder (--terrain-layer-split); null = not ours
+            function classify(f) {
+                const segs = pathOf(f).split('/');
+                let m = f.name.match(rxIds);
+                if (m) return { type: 'ids', full: pathOf(f), dir: segs.length > 1 ? segs.slice(0, -1).join('/') : '(files)', kind: parseInt(m[1], 10), isPng: /png$/i.test(m[2]) };
+                m = f.name.match(rxSplitFile);
+                if (m && segs.length > 1) {
+                    const dm = segs[segs.length - 2].match(rxLayersDir);
+                    if (dm) return { type: 'split', full: pathOf(f), dir: segs.length > 2 ? segs.slice(0, -2).join('/') : '(files)', kind: parseInt(dm[1], 10), id: m[1] !== undefined ? parseInt(m[1], 10) : null };
+                }
+                return null;
+            }
+            function getSet(dir) {
+                if (!SETS.has(dir)) SETS.set(dir, { name: dir, kinds: new Map(), split: new Map() });
+                return SETS.get(dir);
+            }
+
             async function addFiles(list) {
-                const rx = /^k(\d+)_(ids\.png|legend\.csv)$/i;
-                const wanted = list.filter(f => rx.test(f.name));
-                if (!wanted.length) { statusEl.textContent = 'No k<kind>_ids.png / k<kind>_legend.csv files found.'; return; }
-                const touched = new Set();
+                const wanted = list.map(f => ({ f, c: classify(f) })).filter(x => x.c);
+                if (!wanted.length) { statusEl.textContent = 'No k<kind>_ids.png / k<kind>_legend.csv / k<kind>_layers/ files found (split files need their k<kind>_layers folder: use Add folder or drop it).'; return; }
+                const touched = new Set(), touchedSplit = new Set();
                 let ok = 0, bad = 0;
                 for (let i = 0; i < wanted.length; i++) {
-                    const f = wanted[i];
-                    const full = f._path || f.webkitRelativePath || f.name;
-                    const dir = full.includes('/') ? full.slice(0, full.lastIndexOf('/')) : '(files)';
-                    const m = f.name.match(rx), kind = parseInt(m[1], 10), isPng = /png$/i.test(m[2]);
-                    statusEl.textContent = `Reading ${i + 1}/${wanted.length}: ${f.name}`;
-                    await new Promise(r => setTimeout(r));
+                    const { f, c } = wanted[i];
+                    if (i % 10 === 0 || c.type === 'ids') {
+                        statusEl.textContent = `Reading ${i + 1}/${wanted.length}: ${f.name}`;
+                        await new Promise(r => setTimeout(r));
+                    }
                     try {
-                        if (!SETS.has(dir)) SETS.set(dir, { name: dir, kinds: new Map() });
-                        const set = SETS.get(dir);
+                        const set = getSet(c.dir);
+                        if (c.type === 'split') {
+                            if (!set.split.has(c.kind)) set.split.set(c.kind, { kind: c.kind, w: 0, h: 0, layers: new Map(), index: new Map() });
+                            const S = set.split.get(c.kind);
+                            if (c.id === null) {
+                                const rows = parseCSV(await f.text());
+                                rows.slice(1).filter(r => r.length >= 5 && r[0] !== '').forEach(r => S.index.set(parseInt(r[0], 10), { r: +r[1], g: +r[2], b: +r[3], pixels: +r[4], name: r[10] || '' }));
+                            } else {
+                                const L = await loadSplitLayer(S, c.id, f);
+                                if (L) S.layers.set(c.id, L);
+                            }
+                            touchedSplit.add(S); ok++;
+                            continue;
+                        }
+                        const kind = c.kind;
                         if (!set.kinds.has(kind)) set.kinds.set(kind, { kind, w: 0, h: 0, src: null, legend: [], sel: new Set(), visible: false, opacity: 1, pendingLegend: null });
                         const K = set.kinds.get(kind);
-                        if (isPng) { const p = await decodePng(f); K.w = p.w; K.h = p.h; K.src = p.data; }
+                        if (c.isPng) { const p = await decodePng(f); K.w = p.w; K.h = p.h; K.src = p.data; }
                         else {
                             const rows = parseCSV(await f.text());
                             K.pendingLegend = rows.slice(1).filter(r => r.length >= 5 && r[0] !== '').map(r => ({
@@ -258,11 +302,12 @@
                             }));
                         }
                         touched.add(K); ok++;
-                    } catch (err) { bad++; console.warn('Failed to load', full, err); }
+                    } catch (err) { bad++; console.warn('Failed to load', c.full, err); }
                 }
                 statusEl.textContent = 'Building images...';
                 await new Promise(r => setTimeout(r));
                 for (const K of touched) if (K.src) build(K);
+                for (const S of touchedSplit) applySplitIndex(S);
                 statusEl.textContent = `Loaded ${ok} file(s)` + (bad ? `, ${bad} failed (see console)` : '');
 
                 const firstSet = !cur;
@@ -276,6 +321,47 @@
                 }
                 if (!activeKind || !cur.kinds.has(activeKind)) activeKind = cur.kinds.has(2) ? 2 : Math.min(...cur.kinds.keys());
                 refresh(true);
+            }
+
+            // ---- split layers (k<kind>_layers/id_<id>.png): one mask per layer id, cropped to its bounding box ----
+            const splitState = { kind: null, op: 0.6 };
+            function idColour(id) {   // same hash as id_colour() in terrain_layers.rs
+                let h = (Math.imul(id, 0x9E3779B1) ^ 0x85EBCA6B) >>> 0;
+                h = (h ^ (h >>> 15)) >>> 0; h = Math.imul(h, 0x2C1B3C6D) >>> 0; h = (h ^ (h >>> 12)) >>> 0;
+                return [(h & 255) | 0x40, ((h >>> 8) & 255) | 0x40, ((h >>> 16) & 255) | 0x40];
+            }
+            async function loadSplitLayer(S, id, file) {
+                const p = await decodePng(file);
+                S.w = p.w; S.h = p.h;
+                const px = new Uint32Array(p.data.buffer), w = p.w, h = p.h;
+                let x0 = w, y0 = h, x1 = -1, y1 = -1;
+                for (let y = 0; y < h; y++) {
+                    const row = y * w;
+                    for (let x = 0; x < w; x++) {
+                        if (px[row + x] & 0xFF) { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; y1 = y; }
+                    }
+                }
+                if (x1 < 0) return null;   // empty mask
+                const bw = x1 - x0 + 1, bh = y1 - y0 + 1, mask = new Uint8Array(bw * bh);
+                let n = 0;
+                for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) if (px[(y + y0) * w + x + x0] & 0xFF) { mask[y * bw + x] = 1; n++; }
+                const [r, g, b] = idColour(id);
+                return { id, r, g, b, pixels: n, name: '', x0, y0, bw, bh, mask, canvas: null, visible: false };
+            }
+            function applySplitIndex(S) {
+                for (const L of S.layers.values()) {
+                    const e = S.index.get(L.id);
+                    if (e) { L.r = e.r; L.g = e.g; L.b = e.b; L.name = e.name; }
+                    L.canvas = null;
+                }
+            }
+            function ensureCanvas(L) {
+                if (L.canvas) return;
+                const c = document.createElement('canvas'); c.width = L.bw; c.height = L.bh;
+                const img = new ImageData(L.bw, L.bh), d = img.data, m = L.mask;
+                for (let p = 0, o = 0; p < m.length; p++, o += 4) if (m[p]) { d[o] = L.r; d[o + 1] = L.g; d[o + 2] = L.b; d[o + 3] = 255; }
+                c.getContext('2d').putImageData(img, 0, 0);
+                L.canvas = c;
             }
 
             // Turn the PNG + legend into a per-pixel legend index, centroids and the display canvas.
@@ -320,18 +406,23 @@
             }
 
             const kindLabel = k => 'k' + k + (KIND_NAMES[k] ? ' · ' + KIND_NAMES[k] : '');
+            const splitKinds = () => cur ? [...cur.split.values()].filter(S => S.layers.size) : [];
+            const hasData = () => !!cur && (loaded().length > 0 || splitKinds().length > 0);
+            const curSplit = () => { const ks = splitKinds(); return ks.length ? (ks.find(S => S.kind === splitState.kind) || ks[0]) : null; };
             const sortedKinds = () => cur ? [...cur.kinds.values()].sort((a, b) => a.kind - b.kind) : [];
             const loaded = () => sortedKinds().filter(k => k.src);
             const act = () => cur && cur.kinds.get(activeKind);
 
             function extent() {
-                const ks = loaded();
+                const ks = [...loaded(), ...splitKinds()];
                 return { W: Math.max(...ks.map(k => k.w)), H: Math.max(...ks.map(k => k.h)) };
             }
 
             function refresh(fit) {
-                const has = SETS.size > 0 && cur && loaded().length > 0;
-                ['kindsBox', 'controls', 'legendBox', 'statsBox'].forEach(id => $(id).style.display = has ? 'flex' : 'none');
+                const has = SETS.size > 0 && hasData(), hasK = has && loaded().length > 0;
+                ['controls'].forEach(id => $(id).style.display = has ? 'flex' : 'none');
+                ['kindsBox', 'legendBox', 'statsBox'].forEach(id => $(id).style.display = hasK ? 'flex' : 'none');
+                $('splitBox').style.display = has && splitKinds().length ? 'flex' : 'none';
                 $('setBox').style.display = SETS.size > 1 ? 'flex' : 'none';
                 $('empty').style.display = has ? 'none' : 'flex';
                 $('view').style.display = has ? 'block' : 'none';
@@ -343,6 +434,7 @@
 
                 buildKindList();
                 buildLegend();
+                buildSplit();
                 updateStats();
                 resize();
                 if (fit) fitView();
@@ -400,6 +492,38 @@
             }
             $('legendFilter').addEventListener('input', buildLegend);
 
+            function buildSplit() {
+                const ks = splitKinds();
+                if (!ks.length) return;
+                const S = curSplit(), box = $('splitList'), sel = $('splitKind');
+                splitState.kind = S.kind;
+                sel.innerHTML = '';
+                ks.forEach(k => { const o = document.createElement('option'); o.value = k.kind; o.textContent = kindLabel(k.kind) + ' (' + k.layers.size + ' ids)'; if (k === S) o.selected = true; sel.appendChild(o); });
+                box.innerHTML = '';
+                const q = $('splitFilter').value.trim().toLowerCase();
+                S.shown = [];
+                for (const L of [...S.layers.values()].sort((a, b) => b.pixels - a.pixels)) {
+                    if (q && !(String(L.id).includes(q) || L.name.toLowerCase().includes(q))) continue;
+                    S.shown.push(L);
+                    if (S.shown.length > 600) break;
+                    const row = document.createElement('div'); row.className = 'legRow';
+                    const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = L.visible;
+                    cb.onchange = () => { L.visible = cb.checked; draw(); };
+                    const sw = document.createElement('span'); sw.className = 'sw'; sw.style.background = `rgb(${L.r},${L.g},${L.b})`;
+                    const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = L.name || ('id ' + L.id); nm.title = nm.textContent;
+                    const id = document.createElement('span'); id.className = 'id'; id.textContent = L.name ? L.id : '';
+                    const pc = document.createElement('span'); pc.className = 'pc'; pc.textContent = L.pixels; pc.title = L.pixels + ' cells';
+                    row.append(cb, sw, nm, id, pc);
+                    row.onclick = e => { if (e.target !== cb) { cb.checked = !cb.checked; cb.onchange(); } };
+                    box.appendChild(row);
+                }
+            }
+            $('splitKind').onchange = e => { splitState.kind = parseInt(e.target.value, 10); buildSplit(); draw(); };
+            $('splitOp').oninput = e => { splitState.op = e.target.value / 100; draw(); };
+            $('splitFilter').addEventListener('input', buildSplit);
+            $('splitAll').onclick = () => { const S = curSplit(); if (!S) return; (S.shown || []).forEach(L => L.visible = true); buildSplit(); draw(); };
+            $('splitNone').onclick = () => { const S = curSplit(); if (!S) return; S.layers.forEach(L => L.visible = false); buildSplit(); draw(); };
+
             function toggleSel(K, i) {
                 if (K.sel.has(i)) K.sel.delete(i); else K.sel.add(i);
                 paintKind(K); buildLegend(); updateStats(); draw();
@@ -425,7 +549,7 @@
             window.addEventListener('resize', () => { if (cur) { resize(); draw(); } });
 
             function fitView() {
-                if (!cur || !loaded().length) return;
+                if (!hasData()) return;
                 const { W, H } = extent();
                 const w = cv.width / dpr, h = cv.height / dpr;
                 view.s = Math.min(w / W, h / H) * 0.95;
@@ -442,7 +566,7 @@
             }
 
             function draw() {
-                if (!cur || !loaded().length) return;
+                if (!hasData()) return;
                 ctx.setTransform(1, 0, 0, 1, 0, 0);
                 ctx.fillStyle = '#0f1216'; ctx.fillRect(0, 0, cv.width, cv.height);
                 const { W, H } = extent(), s = view.s, fl = flipped();
@@ -456,6 +580,16 @@
                     if (!K.visible) continue;
                     ctx.globalAlpha = K.opacity;
                     ctx.drawImage(K.canvas, 0, 0, W, H);
+                }
+                const SP = curSplit();
+                if (SP) {
+                    const f = W / SP.w;
+                    ctx.globalAlpha = splitState.op;
+                    for (const L of SP.layers.values()) {
+                        if (!L.visible) continue;
+                        ensureCanvas(L);
+                        ctx.drawImage(L.canvas, L.x0 * f, L.y0 * f, L.bw * f, L.bh * f);
+                    }
                 }
                 ctx.globalAlpha = 1;
 
@@ -528,7 +662,7 @@
             }
 
             function hover(sx, sy) {
-                if (!cur || !loaded().length) return;
+                if (!hasData()) return;
                 const { W, H } = extent();
                 const [wx, wy] = toWorld(sx, sy, H);
                 if (wx < 0 || wy < 0 || wx >= W || wy >= H) { tip.style.display = 'none'; return; }
@@ -545,6 +679,20 @@
                     const e = K.legend[i];
                     any = true;
                     html += `<div class="ln"><span class="sw" style="background:rgb(${e.r},${e.g},${e.b})"></span><span class="k">${kindLabel(K.kind)}:</span> <b>${esc(e.name || (e.id === null ? 'unknown colour' : 'id ' + e.id))}</b>${e.id !== null && e.name ? ' <span class="k">(' + e.id + ')</span>' : ''}</div>`;
+                }
+                const SP = curSplit();
+                if (SP) {
+                    const f = W / SP.w, px = Math.floor(wx / f), py = Math.floor(wy / f);
+                    let n = 0, extra = 0;
+                    for (const L of SP.layers.values()) {
+                        if (!L.visible) continue;
+                        const lx = px - L.x0, ly = py - L.y0;
+                        if (lx < 0 || ly < 0 || lx >= L.bw || ly >= L.bh || !L.mask[ly * L.bw + lx]) continue;
+                        any = true;
+                        if (++n > 12) { extra++; continue; }
+                        html += `<div class="ln"><span class="sw" style="background:rgb(${L.r},${L.g},${L.b})"></span><span class="k">${kindLabel(SP.kind)} split:</span> <b>${esc(L.name || ('id ' + L.id))}</b>${L.name ? ' <span class="k">(' + L.id + ')</span>' : ''}</div>`;
+                    }
+                    if (extra) html += `<div class="ln"><span class="k">+${extra} more</span></div>`;
                 }
                 tip.innerHTML = html;
                 tip.style.display = 'block';
