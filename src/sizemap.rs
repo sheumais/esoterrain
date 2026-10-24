@@ -8,14 +8,13 @@ const CELL_PLACEMENT_TYPE: u32 = 0x15;
 const MIN_BRIGHTNESS: f32 = 24.0;
 
 pub fn run(
-    manifest: &str,
+    manifest: &[eso_common::mnf::MnfFileEntry],
     world: u32,
     forced_type: Option<u32>,
     scale: u32,
     out_dir: &Path,
 ) -> Result<PathBuf, String> {
-    let entries = filter_size_manifest(manifest, world)
-        .map_err(|e| format!("Failed to read manifest '{}': {}", manifest, e))?;
+    let entries = filter_size_manifest(manifest, world);
     if entries.is_empty() {
         return Err(format!("No per-cell manifest entries found for world 0x{:x}.", world));
     }
@@ -73,4 +72,4 @@ pub fn run(
     let path = out_dir.join(format!("world_0x{:x}_sizemap.png", world));
     img.save(&path).map_err(|e| format!("Failed to save '{}': {}", path.display(), e))?;
     Ok(path)
-}
+}

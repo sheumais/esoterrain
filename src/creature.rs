@@ -61,18 +61,17 @@ pub struct Table {
 }
 
 impl Table {
-    pub fn load(path: &Path) -> io::Result<Self> {
-        let data = fs::read(path)?;
+    pub fn from_bytes(data: Vec<u8>, label: &str) -> io::Result<Self> {
         let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
         if data.len() < HEADER_LEN || data[..4] != [0xFA, 0xFA, 0xEB, 0xEB] {
-            return Err(bad(format!("'{}': bad magic (is this the _Uncompressed file?)", path.display())));
+            return Err(bad(format!("'{}': bad magic (is this the _Uncompressed file?)", label)));
         }
         let count = be32(&data, 8).unwrap_or(0) as usize;
         let (mut spans, mut by_id, mut by_row) = (Vec::with_capacity(count), HashMap::with_capacity(count), HashMap::with_capacity(count));
         let mut pos = HEADER_LEN;
         for _ in 0..count {
             if data.get(pos..pos + 4) != Some(b"####") {
-                return Err(bad(format!("missing #### at 0x{:x} in '{}'", pos, path.display())));
+                return Err(bad(format!("missing #### at 0x{:x} in '{}'", pos, label)));
             }
             let size = be32(&data, pos + 8).ok_or_else(|| bad("short entry".into()))? as usize;
             let id = be32(&data, pos + 4).unwrap();
@@ -181,4 +180,4 @@ pub fn find_in_lut(path: &Path, id: u32) -> io::Result<Vec<LutRow>> {
         return Ok(by_table);
     }
     Ok(rows.into_iter().filter(|r| r.name_id == id).collect())
-}
+}

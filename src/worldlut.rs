@@ -136,27 +136,6 @@ fn for_each_csv_row(text: &str, mut f: impl FnMut(&[String])) {
     }
 }
 
-pub fn load_lang_group(lang_csv: &Path, group: &str) -> io::Result<HashMap<u32, String>> {
-    let bytes = std::fs::read(lang_csv)?;
-    let text = String::from_utf8_lossy(&bytes);
-    let text = text.trim_start_matches('\u{feff}');
-
-    let mut names = HashMap::new();
-    for_each_csv_row(text, |row| {
-        if row.len() < 5 || row[0] != group {
-            return;
-        }
-        if let Ok(idx) = row[2].trim().parse::<u32>() {
-            names.insert(idx, row[4].clone());
-        }
-    });
-    Ok(names)
-}
-
-pub fn load_zone_names(lang_csv: &Path) -> io::Result<HashMap<u32, String>> {
-    load_lang_group(lang_csv, ZONE_NAME_GROUP)
-}
-
 pub fn write_csv(
     entries: &[WorldEntry],
     zone_names: &HashMap<u32, String>,
@@ -189,12 +168,11 @@ pub fn write_csv(
 }
 
 pub fn parse_and_write(
-    in_path: &Path,
+    data: &[u8],
     zone_names: &HashMap<u32, String>,
     out_path: &Path,
 ) -> io::Result<usize> {
-    let data = std::fs::read(in_path)?;
-    let (entries, skipped) = parse(&data)?;
+    let (entries, skipped) = parse(data)?;
     if skipped > 0 {
         eprintln!("Warning: skipped {} malformed record(s).", skipped);
     }

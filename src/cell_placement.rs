@@ -148,8 +148,8 @@ fn find_first_rtre(buf: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-pub fn parse_cell_file(path: &Path) -> io::Result<Value> {
-    let buf = std::fs::read(path)?;
+pub fn parse_bytes(buf: &[u8]) -> io::Result<Value> {
+    let buf = buf.to_vec();
     let mut r = Rd { b: &buf, o: 0 };
 
     let format_tag = r.u32()?;
@@ -187,9 +187,9 @@ pub fn parse_cell_file(path: &Path) -> io::Result<Value> {
     }))
 }
 
-pub fn parse_and_write_cell(input: &Path, output: &Path) -> io::Result<()> {
-    let v = parse_cell_file(input)?;
+pub fn parse_and_write_cell(input: &[u8], output: &Path) -> io::Result<()> {
+    let v = parse_bytes(input)?;
     let s = serde_json::to_string_pretty(&v).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     if let Some(dir) = output.parent() { std::fs::create_dir_all(dir)?; }
     std::fs::write(output, s)
-}
+}

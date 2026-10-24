@@ -79,4 +79,4 @@ impl ColourMapGrid {
             }
         }
     }
-}
+}

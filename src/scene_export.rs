@@ -165,8 +165,7 @@ pub fn run(a: &SceneArgs, mo: &Options) -> Result<PathBuf, String> {
     let ids: BTreeSet<u32> = insts.iter().map(|i| i.model).collect();
     println!("{} distinct model(s) referenced.", ids.len());
 
-    let rows = model_export::lookup_file_indexes(mo.manifest, &ids.iter().copied().collect())
-        .map_err(|e| format!("Failed to read manifest '{}': {}", mo.manifest, e))?;
+    let rows = model_export::lookup_file_indexes(mo.manifest, &ids.iter().copied().collect());
 
     let mut index_of: HashMap<u32, u32> = HashMap::new();
     let mut not_in_manifest = 0usize;
@@ -900,4 +899,4 @@ for it in items:
     row_d = max(row_d, it['d'])
 
 print('Laid out %d model(s); %d have several versions stacked vertically.' % (len(items), sum(1 for it in items if len(it['versions']) > 1)))
-"#;
+"#;

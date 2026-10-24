@@ -1,7 +1,6 @@
-use std::{
-    collections::{HashMap, HashSet},
-    io,
-};
+use std::collections::{HashMap, HashSet};
+
+use eso_common::mnf::MnfFileEntry;
 
 pub const WORLD_MASK: u32 = 0x7FF;
 pub const TYPE_MASK: u32 = 0x1F;
@@ -69,56 +68,25 @@ pub fn parse_int(s: &str) -> Option<i64> {
     }
 }
 
-pub fn filter_manifest(manifest_path: &str, world: u32) -> io::Result<ManifestResult> {
+pub fn filter_manifest(entries: &[MnfFileEntry], world: u32) -> ManifestResult {
     let target_toc = toc_file_id(world);
     let mut toc_matches = Vec::new();
     let mut cell_matches = Vec::new();
 
-    let content = std::fs::read_to_string(manifest_path)?;
-
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let row: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
-        if row.len() < 11 {
-            continue;
-        }
-
-        let (index, file_index, unk1, arch) = match (
-            parse_int(row[0]),
-            parse_int(row[2]),
-            parse_int(row[3]),
-            parse_int(row[9]),
-        ) {
-            (Some(i), Some(fi), Some(u), Some(a)) => (i, fi, u, a),
-            _ => continue,
-        };
-
-        let file_id = (((unk1 as u64) & 0xFFFF_FFFF) << 32) | ((file_index as u64) & 0xFFFF_FFFF);
+    for e in entries {
+        let file_id = ((e.unknown1 as u64) << 32) | (e.file_index as u64);
 
         if file_id == target_toc {
-            toc_matches.push(TocMatch {
-                index: index as u32,
-                arch: arch as u32,
-            });
+            toc_matches.push(TocMatch { index: e.index, arch: e.archive_index as u32 });
             continue;
         }
 
         if let Some((x, z)) = decode_cell_from_fileid(file_id, world) {
-            cell_matches.push(CellMatch {
-                index: index as u32,
-                x,
-                z,
-                arch: arch as u32,
-            });
+            cell_matches.push(CellMatch { index: e.index, x, z, arch: e.archive_index as u32 });
         }
     }
 
-    Ok(ManifestResult {
-        toc_matches,
-        cell_matches,
-    })
+    ManifestResult { toc_matches, cell_matches }
 }
 
 pub const COLOURMAP_TYPE_NORMAL: u32 = 0x0C;
@@ -137,67 +105,40 @@ pub struct ColourMapMatch {
     pub arch: u32,
 }
 
-pub fn filter_colourmap_manifest(manifest_path: &str, world: u32) -> io::Result<Vec<ColourMapMatch>> {
+pub fn filter_colourmap_manifest(entries: &[MnfFileEntry], world: u32) -> Vec<ColourMapMatch> {
     let target_normal = colourmap_high(world, COLOURMAP_TYPE_NORMAL);
     let target_overlay = colourmap_high(world, COLOURMAP_TYPE_OVERLAY);
 
     let mut matches = Vec::new();
-    let content = std::fs::read_to_string(manifest_path)?;
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let row: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
-        if row.len() < 11 {
-            continue;
-        }
-        let (index, file_index, unk1, arch) = match (
-            parse_int(row[0]), parse_int(row[2]), parse_int(row[3]), parse_int(row[9]),
-        ) {
-            (Some(i), Some(fi), Some(u), Some(a)) => (i as u32, fi as u32, u as u32, a as u32),
-            _ => continue,
-        };
-
-        let overlay = if unk1 == target_normal {
+    for e in entries {
+        let overlay = if e.unknown1 == target_normal {
             false
-        } else if unk1 == target_overlay {
+        } else if e.unknown1 == target_overlay {
             true
         } else {
             continue;
         };
-
         matches.push(ColourMapMatch {
-            index,
-            x: file_index >> 16,
-            z: file_index & 0xFFFF,
+            index: e.index,
+            x: e.file_index >> 16,
+            z: e.file_index & 0xFFFF,
             overlay,
-            arch,
+            arch: e.archive_index as u32,
         });
     }
-    Ok(matches)
+    matches
 }
 
-/// Every per-world placement file (manifest category 0x4800, FileIndex 0) of the requested types, in ONE pass over
-/// the manifest: (world, type) -> first matching row. Use this instead of calling `filter_placement_manifest`
-/// once per world, which re-reads the whole manifest each time.
+/// Every per-world placement file (category 0x4800, FileIndex 0) of the requested types in ONE pass:
+/// (world, type) -> first matching entry.
 pub fn filter_placement_manifest_all(
-    manifest_path: &str,
+    entries: &[MnfFileEntry],
     types: &[u32],
-) -> io::Result<HashMap<(u32, u32), PlacementMatch>> {
-    let content = std::fs::read_to_string(manifest_path)?;
+) -> HashMap<(u32, u32), PlacementMatch> {
     let mut out: HashMap<(u32, u32), PlacementMatch> = HashMap::new();
-    for line in content.lines() {
-        let row: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
-        if row.len() < 11 {
-            continue;
-        }
-        let (index, file_index, unk1, arch) = match (
-            parse_int(row[0]), parse_int(row[2]), parse_int(row[3]), parse_int(row[9]),
-        ) {
-            (Some(i), Some(fi), Some(u), Some(a)) => (i as u32, fi as u32, u as u32, a as u32),
-            _ => continue,
-        };
-        if (unk1 >> 16) != (PLACEMENT_CATEGORY >> 16) || file_index != 0 {
+    for e in entries {
+        let unk1 = e.unknown1;
+        if (unk1 >> 16) != (PLACEMENT_CATEGORY >> 16) || e.file_index != 0 {
             continue;
         }
         let ty = unk1 & TYPE_MASK;
@@ -205,35 +146,17 @@ pub fn filter_placement_manifest_all(
             continue;
         }
         let world = (unk1 >> 5) & WORLD_MASK;
-        out.entry((world, ty)).or_insert(PlacementMatch { index, arch });
+        out.entry((world, ty)).or_insert(PlacementMatch { index: e.index, arch: e.archive_index as u32 });
     }
-    Ok(out)
+    out
 }
 
-pub fn filter_placement_manifest(manifest_path: &str, world: u32) -> io::Result<Option<PlacementMatch>> {
+pub fn filter_placement_manifest(entries: &[MnfFileEntry], world: u32) -> Option<PlacementMatch> {
     let target = placement_high(world);
-    let content = std::fs::read_to_string(manifest_path)?;
-
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let row: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
-        if row.len() < 11 {
-            continue;
-        }
-        let (index, file_index, unk1, arch) = match (
-            parse_int(row[0]), parse_int(row[2]), parse_int(row[3]), parse_int(row[9]),
-        ) {
-            (Some(i), Some(fi), Some(u), Some(a)) => (i as u32, fi as u32, u as u32, a as u32),
-            _ => continue,
-        };
-
-        if unk1 == target && file_index == 0 {
-            return Ok(Some(PlacementMatch { index, arch }));
-        }
-    }
-    Ok(None)
+    entries
+        .iter()
+        .find(|e| e.unknown1 == target && e.file_index == 0)
+        .map(|e| PlacementMatch { index: e.index, arch: e.archive_index as u32 })
 }
 
 const TERRAIN_CELL_TYPE: u32 = 0x01;
@@ -267,28 +190,11 @@ impl WorldSummary {
     }
 }
 
-pub fn list_worlds_with_cells(manifest_path: &str) -> io::Result<Vec<WorldSummary>> {
-    let content = std::fs::read_to_string(manifest_path)?;
+pub fn list_worlds_with_cells(entries: &[MnfFileEntry]) -> Vec<WorldSummary> {
+    let mut per_world: HashMap<u32, (u32, u32, u32, u32, usize, HashSet<u32>)> = HashMap::new();
 
-    let mut per_world: std::collections::HashMap<u32, (u32, u32, u32, u32, usize, HashSet<u32>)> = std::collections::HashMap::new();
-
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let row: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
-        if row.len() < 11 {
-            continue;
-        }
-
-        let (file_index, unk1, arch) = match (
-            parse_int(row[2]),
-            parse_int(row[3]),
-            parse_int(row[9]),
-        ) {
-            (Some(fi), Some(u), Some(a)) => (fi as u32, u as u32, a as u32),
-            _ => continue,
-        };
+    for e in entries {
+        let (file_index, unk1, arch) = (e.file_index, e.unknown1, e.archive_index as u32);
 
         if (unk1 >> 16) != CELL_HIGH_MARKER {
             continue;
@@ -314,24 +220,14 @@ pub fn list_worlds_with_cells(manifest_path: &str) -> io::Result<Vec<WorldSummar
 
     let mut summaries: Vec<WorldSummary> = per_world
         .into_iter()
-        .map(
-            |(world, (min_x, max_x, min_z, max_z, cell_count, archives))| {
-                let mut archives: Vec<u32> = archives.into_iter().collect();
-                archives.sort_unstable();
-                WorldSummary {
-                    world,
-                    min_x,
-                    max_x,
-                    min_z,
-                    max_z,
-                    cell_count,
-                    archives,
-                }
-            },
-        )
+        .map(|(world, (min_x, max_x, min_z, max_z, cell_count, archives))| {
+            let mut archives: Vec<u32> = archives.into_iter().collect();
+            archives.sort_unstable();
+            WorldSummary { world, min_x, max_x, min_z, max_z, cell_count, archives }
+        })
         .collect();
     summaries.sort_unstable_by_key(|w| w.world);
-    Ok(summaries)
+    summaries
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -344,29 +240,11 @@ pub const TABLE_HIGH: u32 = 0x6000_0000;
 pub const WORLD_LUT_FILE_INDEX: u32 = 0x3C;
 pub const MODEL_LIST_FILE_INDEX: u32 = 0x145;
 
-pub fn filter_table_manifest(
-    manifest_path: &str,
-    target_file_index: u32,
-) -> io::Result<Option<TableMatch>> {
-    let content = std::fs::read_to_string(manifest_path)?;
-    for line in content.lines() {
-        let row: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
-        if row.len() < 11 {
-            continue;
-        }
-        let (index, id1, file_index, unk1, arch) = match (
-            parse_int(row[0]), parse_int(row[1]), parse_int(row[2]), parse_int(row[3]), parse_int(row[9]),
-        ) {
-            (Some(i), Some(id), Some(fi), Some(u), Some(a)) => {
-                (i as u32, id as u32, fi as u32, u as u32, a as u32)
-            }
-            _ => continue,
-        };
-        if unk1 == TABLE_HIGH && file_index == target_file_index && id1 == 0 {
-            return Ok(Some(TableMatch { index, arch }));
-        }
-    }
-    Ok(None)
+pub fn filter_table_manifest(entries: &[MnfFileEntry], target_file_index: u32) -> Option<TableMatch> {
+    entries
+        .iter()
+        .find(|e| e.unknown1 == TABLE_HIGH && e.file_index == target_file_index && e.id1 == 0)
+        .map(|e| TableMatch { index: e.index, arch: e.archive_index as u32 })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -377,23 +255,17 @@ pub struct CellPlacementMatch {
     pub arch: u32,
 }
 
-pub fn filter_cell_placement_manifest(manifest_path: &str, world: u32) -> io::Result<Vec<CellPlacementMatch>> {
-    let content = std::fs::read_to_string(manifest_path)?;
+pub fn filter_cell_placement_manifest(entries: &[MnfFileEntry], world: u32) -> Vec<CellPlacementMatch> {
     let mut out = Vec::new();
-    for line in content.lines() {
-        let row: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
-        if row.len() < 11 { continue; }
-        let (index, file_index, unk1, arch) = match (parse_int(row[0]), parse_int(row[2]), parse_int(row[3]), parse_int(row[9])) {
-            (Some(i), Some(f), Some(u), Some(a)) => (i as u32, f as u32, u as u32, a as u32),
-            _ => continue,
-        };
+    for e in entries {
+        let unk1 = e.unknown1;
         if (unk1 >> 16) != CELL_HIGH_MARKER
             || ((unk1 >> 5) & WORLD_MASK) != world
             || (unk1 & TYPE_MASK) != CELL_PLACEMENT_TYPE
         { continue; }
-        out.push(CellPlacementMatch { index, x: file_index >> 16, z: file_index & 0xFFFF, arch });
+        out.push(CellPlacementMatch { index: e.index, x: e.file_index >> 16, z: e.file_index & 0xFFFF, arch: e.archive_index as u32 });
     }
-    Ok(out)
+    out
 }
 
 /// Manifest file type (low 5 bits of Unk1) of the terrain LOD mesh files - entry 0x0A ("terrain-lod") in the world TOC.
@@ -407,23 +279,17 @@ pub struct LodMatch {
     pub arch: u32,
 }
 
-pub fn filter_lod_manifest(manifest_path: &str, world: u32) -> io::Result<Vec<LodMatch>> {
-    let content = std::fs::read_to_string(manifest_path)?;
+pub fn filter_lod_manifest(entries: &[MnfFileEntry], world: u32) -> Vec<LodMatch> {
     let mut out = Vec::new();
-    for line in content.lines() {
-        let row: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
-        if row.len() < 11 { continue; }
-        let (index, file_index, unk1, arch) = match (parse_int(row[0]), parse_int(row[2]), parse_int(row[3]), parse_int(row[9])) {
-            (Some(i), Some(f), Some(u), Some(a)) => (i as u32, f as u32, u as u32, a as u32),
-            _ => continue,
-        };
+    for e in entries {
+        let unk1 = e.unknown1;
         if (unk1 >> 16) != CELL_HIGH_MARKER
             || ((unk1 >> 5) & WORLD_MASK) != world
             || (unk1 & TYPE_MASK) != TERRAIN_LOD_TYPE
         { continue; }
-        out.push(LodMatch { index, x: file_index >> 16, z: file_index & 0xFFFF, arch });
+        out.push(LodMatch { index: e.index, x: e.file_index >> 16, z: e.file_index & 0xFFFF, arch: e.archive_index as u32 });
     }
-    Ok(out)
+    out
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -432,30 +298,21 @@ pub struct SizeEntry {
     pub x: u32,
     pub z: u32,
     pub size: u32,
-
 }
 
-pub fn filter_size_manifest(manifest_path: &str, world: u32) -> io::Result<Vec<SizeEntry>> {
-    let content = std::fs::read_to_string(manifest_path)?;
+pub fn filter_size_manifest(entries: &[MnfFileEntry], world: u32) -> Vec<SizeEntry> {
     let mut out = Vec::new();
-    for line in content.lines() {
-        let row: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
-        if row.len() < 11 {
-            continue;
-        }
-        let (file_index, unk1, size) = match (parse_int(row[2]), parse_int(row[3]), parse_int(row[4])) {
-            (Some(fi), Some(u), Some(sz)) => (fi as u32, u as u32, sz as u32),
-            _ => continue,
-        };
+    for e in entries {
+        let unk1 = e.unknown1;
         if (unk1 >> 16) != CELL_HIGH_MARKER || ((unk1 >> 5) & WORLD_MASK) != world {
             continue;
         }
         out.push(SizeEntry {
             ty: unk1 & TYPE_MASK,
-            x: file_index >> 16,
-            z: file_index & 0xFFFF,
-            size,
+            x: e.file_index >> 16,
+            z: e.file_index & 0xFFFF,
+            size: e.size,
         });
     }
-    Ok(out)
+    out
 }

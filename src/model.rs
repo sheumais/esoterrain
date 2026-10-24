@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fs, io::{self, Write}, path::Path};
+use std::{collections::HashMap, io::{self, Write}, path::Path};
 
 const HEADER_LEN: usize = 16;
 const ENTRY_HEADER_LEN: usize = 32;
@@ -13,8 +13,7 @@ pub fn be32(b: &[u8], o: usize) -> Option<u32> {
     b.get(o..o + 4).map(|s| u32::from_be_bytes(s.try_into().unwrap()))
 }
 
-pub fn parse(path: &Path) -> io::Result<Vec<ModelRecord>> {
-    let data = fs::read(path)?;
+pub fn parse(data: &[u8]) -> io::Result<Vec<ModelRecord>> {
     let bad = |m: &str| io::Error::new(io::ErrorKind::InvalidData, m.to_string());
 
     if data.len() < HEADER_LEN || data[0..4] != [0xFA, 0xFA, 0xEB, 0xEB] {
@@ -43,11 +42,11 @@ pub fn parse(path: &Path) -> io::Result<Vec<ModelRecord>> {
 pub const MODEL_NAME_GROUP: &str = "242841733";
 
 pub fn parse_and_write(
-    path: &Path,
+    data: &[u8],
     names: &HashMap<u32, String>,
     out_path: &Path,
 ) -> io::Result<usize> {
-    let records = parse(path)?;
+    let records = parse(data)?;
     let mut unnamed = 0usize;
 
     let mut f = io::BufWriter::new(std::fs::File::create(out_path)?);
@@ -71,4 +70,4 @@ pub fn parse_and_write(
     }
     f.flush()?;
     Ok(records.len())
-}
+}

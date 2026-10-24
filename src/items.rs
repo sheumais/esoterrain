@@ -236,4 +236,4 @@ pub fn find_in_lut(path: &Path, id: u32) -> io::Result<Vec<LutRow>> {
         });
     }
     Ok(rows)
-}
+}

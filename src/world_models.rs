@@ -18,23 +18,17 @@
 //! Only the 8-byte header and the 96-byte instance records are read; the R-trees
 //! are never touched, and no intermediate JSON is built, so a full run over ~1200 worlds stays cheap.
 //!
-//! Each archive is exported once, every file we need from it is parsed, then the temp dir is wiped.
+//! Every placement file needed is read once, straight from the archives (archive/offset order), and parsed as it arrives.
 //! A world whose placement file fails to parse is not written (and its old CSV is left alone), so a bad
 //! export can't show up as a flood of fake "removed" lines in the next diff.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::io;
-use std::path::{Path, PathBuf};
-use walkdir::WalkDir;
+use std::path::Path;
 
-use crate::{export, manifest};
-
-// DISABLED: esoextractdata has a bug that breaks single-file (-f) extraction of placement files, so every run
-// currently exports whole archives. To re-enable: restore `export::export_file` (same as `export_archive` but
-// with `.arg("-f").arg(file_index)`), uncomment SMALL_BATCH and the `small` block in `run`.
-// /// Below this many worlds, extract just the placement files instead of whole archives (much faster for one zone).
-// const SMALL_BATCH: usize = 10;
+use crate::archive::Archive;
+use crate::manifest;
 
 const INSTANCE_SIZE: usize = 96;
 const OFF_ROT: usize = 16;
@@ -62,11 +56,10 @@ fn quant(v: f64, scale: i64) -> i32 {
 }
 
 /// World `placement` file: u32 tag, u32 count, then count * 96-byte instance records.
-fn parse_instances(path: &Path) -> io::Result<Vec<Row>> {
+fn parse_instances(b: &[u8], label: &str) -> io::Result<Vec<Row>> {
     let bad = |m: String| io::Error::new(io::ErrorKind::InvalidData, m);
-    let b = std::fs::read(path)?;
     if b.len() < 8 {
-        return Err(bad(format!("{}: file too short", path.display())));
+        return Err(bad(format!("{}: file too short", label)));
     }
     let count = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
     let fits = count
@@ -74,7 +67,7 @@ fn parse_instances(path: &Path) -> io::Result<Vec<Row>> {
         .and_then(|n| n.checked_add(8))
         .map_or(false, |n| n <= b.len());
     if !fits {
-        return Err(bad(format!("{}: instance_count {} does not fit in file", path.display(), count)));
+        return Err(bad(format!("{}: instance_count {} does not fit in file", label, count)));
     }
     let mut rows = Vec::with_capacity(count);
     for i in 0..count {
@@ -157,67 +150,46 @@ struct Tally {
 }
 
 pub struct RunArgs<'a> {
-    pub manifest: &'a str,
-    pub exe: &'a str,
-    pub mnf: &'a str,
-    pub temp_dir: &'a str,
+    pub archive: &'a Archive,
     /// Usually `luts/worlds`.
     pub out_dir: &'a Path,
     /// Empty = every world in the manifest.
     pub only_worlds: &'a [u32],
     pub with_rot: bool,
     pub dry_run: bool,
-    pub skip_export: bool,
-    pub keep_temp: bool,
-}
-
-fn index_paths(dir: &str, wanted: &HashSet<u32>) -> HashMap<u32, PathBuf> {
-    let mut m = HashMap::new();
-    for e in WalkDir::new(dir).into_iter().filter_map(Result::ok) {
-        let p = e.path();
-        if !p.is_file() {
-            continue;
-        }
-        if let Some(i) = p.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u32>().ok()) {
-            if wanted.contains(&i) {
-                m.entry(i).or_insert_with(|| p.to_path_buf());
-            }
-        }
-    }
-    m
 }
 
 fn process(
-    jobs: &[Job],
-    paths: &HashMap<u32, PathBuf>,
+    j: &Job,
+    data: Result<Vec<u8>, String>,
     states: &mut HashMap<u32, WorldState>,
     a: &RunArgs,
     t: &mut Tally,
 ) {
-    for j in jobs {
-        let Some(st) = states.get_mut(&j.world) else { continue };
-        match paths.get(&j.index) {
-            Some(p) => match parse_instances(p) {
+    {
+        let Some(st) = states.get_mut(&j.world) else { return };
+        match data {
+            Ok(bytes) => match parse_instances(&bytes, &format!("index {}", j.index)) {
                 Ok(mut r) => st.rows.append(&mut r),
                 Err(e) => {
                     eprintln!("  world 0x{:x} (index {}): {}", j.world, j.index, e);
                     st.failed = true;
                 }
             },
-            None => {
-                eprintln!("  world 0x{:x} (index {}): file not found after export", j.world, j.index);
+            Err(e) => {
+                eprintln!("  world 0x{:x} (index {}): {}", j.world, j.index, e);
                 st.failed = true;
             }
         }
         st.remaining -= 1;
         if st.remaining > 0 {
-            continue;
+            return;
         }
 
         let mut st = states.remove(&j.world).unwrap();
         if st.failed {
             t.failed.push(j.world);
-            continue;
+            return;
         }
         let out = a.out_dir.join(format!("world_0x{:03x}.csv", j.world));
         match write_csv(&out, &mut st.rows, a.with_rot) {
@@ -234,8 +206,8 @@ fn process(
 }
 
 pub fn run(a: &RunArgs) -> Result<(), String> {
-    let summaries = manifest::list_worlds_with_cells(a.manifest)
-        .map_err(|e| format!("Failed to read manifest '{}': {}", a.manifest, e))?;
+    let entries = a.archive.entries();
+    let summaries = manifest::list_worlds_with_cells(entries);
     let mut worlds: Vec<u32> = summaries.iter().map(|s| s.world).collect();
     worlds.sort_unstable();
     worlds.dedup();
@@ -249,12 +221,11 @@ pub fn run(a: &RunArgs) -> Result<(), String> {
 
     let available = |arch: u32| (arch as u64) < (manifest::UNAVAILABLE_ARCHIVE_THRESHOLD as u64);
 
-    // One pass over the manifest for both placement types (instead of re-reading it once per world).
+    // One pass over the entries for both placement types.
     let placements = manifest::filter_placement_manifest_all(
-        a.manifest,
+        entries,
         &[manifest::PLACEMENT_TYPE, manifest::PLACEMENT_TYPE_SECONDARY],
-    )
-    .map_err(|e| format!("Failed to read manifest '{}': {}", a.manifest, e))?;
+    );
 
     let mut by_arch: BTreeMap<u32, Vec<Job>> = BTreeMap::new();
     let mut states: HashMap<u32, WorldState> = HashMap::new();
@@ -294,48 +265,28 @@ pub fn run(a: &RunArgs) -> Result<(), String> {
 
     let mut tally = Tally::default();
 
-    if a.skip_export {
-        println!("\nSkipping export step (--skip-export).");
-        let all: Vec<Job> = by_arch.into_values().flatten().collect();
-        let wanted: HashSet<u32> = all.iter().map(|j| j.index).collect();
-        let paths = index_paths(a.temp_dir, &wanted);
-        process(&all, &paths, &mut states, a, &mut tally);
-    } else {
-        let total = by_arch.len();
-        // let small = states.len() < SMALL_BATCH;
-        // if small && !states.is_empty() {
-        //     println!("{} world(s): exporting individual files instead of whole archives.", states.len());
-        // }
-        for (k, (arch, jobs)) in by_arch.iter().enumerate() {
-            println!("\n[{}/{}] Archive {}: {} placement file(s)", k + 1, total, arch, jobs.len());
-            // if small {
-            //     for j in jobs {
-            //         if !export::export_file(a.exe, a.mnf, a.temp_dir, *arch, j.index, a.dry_run) {
-            //             eprintln!("  File export reported an error for index {}; that world will be skipped.", j.index);
-            //         }
-            //     }
-            // } else
-            if !export::export_archive(a.exe, a.mnf, a.temp_dir, *arch, a.dry_run) {
-                eprintln!("  Archive export reported an error; affected worlds will be skipped.");
-            }
-            if a.dry_run {
-                continue;
-            }
-            let wanted: HashSet<u32> = jobs.iter().map(|j| j.index).collect();
-            let paths = index_paths(a.temp_dir, &wanted);
-            process(jobs, &paths, &mut states, a, &mut tally);
-            if !a.keep_temp {
-                if let Err(e) = std::fs::remove_dir_all(a.temp_dir) {
-                    eprintln!("  Warning: failed to clear '{}': {}", a.temp_dir, e);
-                }
-            }
+    let mut jobs_by_index: HashMap<u32, Vec<Job>> = HashMap::new();
+    for (arch, jobs) in by_arch {
+        println!("Archive {}: {} placement file(s)", arch, jobs.len());
+        for j in jobs {
+            jobs_by_index.entry(j.index).or_default().push(j);
         }
     }
+    let mut wanted: Vec<u32> = jobs_by_index.keys().copied().collect();
+    wanted.sort_unstable();
 
     if a.dry_run {
-        println!("\nDry run complete; nothing was parsed or written.");
+        println!("\nDry run complete; {} placement file(s) would be read, nothing was parsed or written.", wanted.len());
         return Ok(());
     }
+
+    a.archive.read_each(&wanted, |e, data| {
+        let Some(jobs) = jobs_by_index.get(&e.index) else { return };
+        for j in jobs.iter() {
+            let d = data.clone();
+            process(j, d, &mut states, a, &mut tally);
+        }
+    });
 
     println!("\nWrote {} world file(s), {} instance row(s) -> {}", tally.written, tally.rows, a.out_dir.display());
     if !tally.failed.is_empty() {
@@ -344,10 +295,7 @@ pub fn run(a: &RunArgs) -> Result<(), String> {
         eprintln!("{} world(s) NOT written (incomplete data, existing CSV left untouched): {}", tally.failed.len(), list.join(", "));
     }
     if !states.is_empty() {
-        eprintln!("{} world(s) never completed (export failed for their archive); existing CSVs left untouched.", states.len());
-    }
-    if !a.keep_temp && a.skip_export == false {
-        let _ = std::fs::remove_dir_all(a.temp_dir);
+        eprintln!("{} world(s) never completed (a placement file could not be read); existing CSVs left untouched.", states.len());
     }
     if tally.failed.is_empty() && states.is_empty() { Ok(()) } else { Err("Some worlds were not written.".to_string()) }
 }

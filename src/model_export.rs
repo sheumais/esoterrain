@@ -24,16 +24,17 @@
 //!
 
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
-use crate::export;
-use crate::manifest::parse_int;
+use crate::archive::{self, Archive};
+use crate::out::Scratch;
 
 const REF_SIG: [u8; 28] = [
     0x08, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00,
@@ -45,21 +46,60 @@ const REF_SCAN_LIMIT: usize = 1 << 20;
 
 const SLOT_ROLES: &[&str] = &["diffuse", "normal", "specular"];
 
-const MODEL_EXTS: &[&str] = &["gr2"];
-const TEXTURE_EXTS: &[&str] = &["dds", "xv4"];
-
 pub struct Options<'a> {
-    pub manifest: &'a str,
-    pub exe: &'a str,
-    pub mnf: &'a str,
-    pub temp_dir: &'a str,
+    pub archive: &'a Archive,
+    pub manifest: &'a RowMap,
+    pub cache: &'a ReadCache,
     pub out_root: &'a Path,
     pub dry_run: bool,
-    pub skip_export: bool,
-    pub keep_temp: bool,
-    
     pub noesis: &'a str,
 }
+
+/// Bytes of entries read so far, shared by everything in one command (parts of an item share textures).
+/// Bounded: `trim` drops everything once the limit is passed, so a long batch cannot grow without end.
+#[derive(Default)]
+pub struct ReadCache {
+    map: RefCell<HashMap<u32, Rc<Vec<u8>>>>,
+    bytes: Cell<usize>,
+}
+
+impl ReadCache {
+    pub fn new() -> Self { Self::default() }
+
+    /// Reads all of `indices` that are not cached yet in one pass over the archive (archive/offset order).
+    pub fn prefetch(&self, archive: &Archive, indices: &[u32]) {
+        let missing: Vec<u32> = {
+            let m = self.map.borrow();
+            indices.iter().copied().filter(|i| !m.contains_key(i)).collect()
+        };
+        if missing.is_empty() { return; }
+        archive.read_each(&missing, |e, r| match r {
+            Ok(b) => self.insert(e.index, b),
+            Err(msg) => eprintln!("  Warning: {}", msg),
+        });
+    }
+
+    fn insert(&self, index: u32, b: Vec<u8>) {
+        self.bytes.set(self.bytes.get() + b.len());
+        self.map.borrow_mut().insert(index, Rc::new(b));
+    }
+
+    pub fn get(&self, archive: &Archive, index: u32) -> Result<Rc<Vec<u8>>, String> {
+        if let Some(b) = self.map.borrow().get(&index) { return Ok(b.clone()); }
+        let b = archive.read(index)?;
+        self.insert(index, b);
+        Ok(self.map.borrow()[&index].clone())
+    }
+
+    pub fn trim(&self, limit_bytes: usize) {
+        if self.bytes.get() > limit_bytes {
+            self.map.borrow_mut().clear();
+            self.bytes.set(0);
+        }
+    }
+}
+
+const CACHE_LIMIT: usize = 768 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct MnfRow {
@@ -76,52 +116,29 @@ pub struct Summary {
     pub textures_missing: usize,
 }
 
-type RowMap = HashMap<u32, Vec<MnfRow>>;
+pub type RowMap = HashMap<u32, Vec<MnfRow>>;
 
-fn manifest_rows(manifest_path: &str) -> io::Result<Arc<RowMap>> {
-    static CACHE: Mutex<Option<(String, Arc<RowMap>)>> = Mutex::new(None);
-    let mut guard = CACHE.lock().unwrap();
-    if let Some((p, m)) = guard.as_ref() {
-        if p == manifest_path {
-            return Ok(m.clone());
-        }
-    }
-    let content = fs::read_to_string(manifest_path)?;
+/// Entries with `unknown1 == 0`, keyed by `file_index`: how texture/model references (FileIndex) are resolved.
+/// Several entries can share a FileIndex; callers take the first (see `pick_row`).
+pub fn build_rows(entries: &[eso_common::mnf::MnfFileEntry]) -> RowMap {
     let mut out: RowMap = HashMap::new();
-    for line in content.lines() {
-        let row: Vec<&str> = line.split(',').map(|c| c.trim()).collect();
-        if row.len() < 11 {
+    for e in entries {
+        if e.unknown1 != 0 {
             continue;
         }
-        let (index, id1, file_index, unk1, size, arch) = match (
-            parse_int(row[0]),
-            parse_int(row[1]),
-            parse_int(row[2]),
-            parse_int(row[3]),
-            parse_int(row[4]),
-            parse_int(row[9]),
-        ) {
-            (Some(i), Some(id), Some(fi), Some(u), Some(sz), Some(a)) => {
-                (i as u32, id as u32, fi as u32, u as u32, sz as u32, a as u32)
-            }
-            _ => continue,
-        };
-        if unk1 != 0 {
-            continue;
-        }
-        out.entry(file_index).or_default().push(MnfRow { index, id1, file_index, size, arch });
+        out.entry(e.file_index).or_default().push(MnfRow {
+            index: e.index,
+            id1: e.id1,
+            file_index: e.file_index,
+            size: e.size,
+            arch: e.archive_index as u32,
+        });
     }
-    let arc = Arc::new(out);
-    *guard = Some((manifest_path.to_string(), arc.clone()));
-    Ok(arc)
+    out
 }
 
-pub fn lookup_file_indexes(
-    manifest_path: &str,
-    wanted: &HashSet<u32>,
-) -> io::Result<HashMap<u32, Vec<MnfRow>>> {
-    let all = manifest_rows(manifest_path)?;
-    Ok(wanted.iter().filter_map(|k| all.get(k).map(|v| (*k, v.clone()))).collect())
+pub fn lookup_file_indexes(all: &RowMap, wanted: &HashSet<u32>) -> HashMap<u32, Vec<MnfRow>> {
+    wanted.iter().filter_map(|k| all.get(k).map(|v| (*k, v.clone()))).collect()
 }
 
 pub fn texture_refs(blob: &[u8]) -> Vec<u32> {
@@ -992,124 +1009,6 @@ fn norm_name(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_alphanumeric()).map(|c| c.to_ascii_lowercase()).collect()
 }
 
-struct Ctx<'a> {
-    o: &'a Options<'a>,
-    prefer_file_index: Cell<bool>,
-}
-
-fn run_exporter(c: &Ctx, arch: u32, filter: u32) -> bool {
-    let o = c.o;
-    println!("Running: {} {} {} -a {} -f {}", o.exe, o.mnf, o.temp_dir, arch, filter);
-    if o.dry_run {
-        println!("  (dry run, not executing)");
-        return true;
-    }
-    if let Err(e) = fs::create_dir_all(o.temp_dir) {
-        eprintln!("  Failed to create '{}': {}", o.temp_dir, e);
-        return false;
-    }
-    invalidate_index();
-    match Command::new(o.exe)
-        .arg(o.mnf)
-        .arg(o.temp_dir)
-        .arg("-a")
-        .arg(arch.to_string())
-        .arg("-f")
-        .arg(filter.to_string())
-        .output()
-    {
-        Ok(out) => {
-            if !out.status.success() {
-                eprintln!("  Warning: exporter exited with status {:?}", out.status.code());
-                if !out.stderr.is_empty() {
-                    eprintln!("{}", String::from_utf8_lossy(&out.stderr));
-                }
-            }
-            true
-        }
-        Err(e) => {
-            eprintln!("  Failed to launch exporter '{}': {}", o.exe, e);
-            false
-        }
-    }
-}
-
-thread_local! {
-    static STEM_INDEX: RefCell<Option<HashMap<u32, Vec<PathBuf>>>> = RefCell::new(None);
-}
-
-fn invalidate_index() {
-    STEM_INDEX.with(|c| *c.borrow_mut() = None);
-}
-
-fn build_index(dir: &Path) -> HashMap<u32, Vec<PathBuf>> {
-    let mut map: HashMap<u32, Vec<PathBuf>> = HashMap::new();
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let Ok(rd) = fs::read_dir(&d) else { continue };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                stack.push(p);
-                continue;
-            }
-            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()).and_then(|s| s.parse::<u32>().ok()) {
-                map.entry(stem).or_default().push(p);
-            }
-        }
-    }
-    map
-}
-
-fn find_by_stem(dir: &Path, stem: u32, exts: &[&str]) -> Option<PathBuf> {
-    STEM_INDEX.with(|c| {
-        let mut c = c.borrow_mut();
-        let idx = c.get_or_insert_with(|| build_index(dir));
-        let mut best: Option<(usize, &PathBuf)> = None;
-        for p in idx.get(&stem)? {
-            let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
-            if let Some(rank) = exts.iter().position(|x| *x == ext) {
-                if best.map_or(true, |(r, _)| rank < r) {
-                    best = Some((rank, p));
-                }
-            }
-        }
-        best.map(|(_, p)| p.clone())
-    })
-}
-
-fn fetch(c: &Ctx, row: &MnfRow, exts: &[&str]) -> Option<PathBuf> {
-    let temp = Path::new(c.o.temp_dir);
-    if let Some(p) = find_by_stem(temp, row.index, exts) {
-        return Some(p);
-    }
-    if c.o.skip_export {
-        return None;
-    }
-
-    let mut tries = vec![row.index, row.file_index];
-    if row.index == row.file_index {
-        tries.truncate(1);
-    } else if c.prefer_file_index.get() {
-        tries.reverse();
-    }
-    for filter in tries {
-        if !run_exporter(c, row.arch, filter) {
-            return None;
-        }
-        if c.o.dry_run {
-            return None;
-        }
-        if let Some(p) = find_by_stem(temp, row.index, exts) {
-            if filter == row.file_index && filter != row.index {
-                c.prefer_file_index.set(true);
-            }
-            return Some(p);
-        }
-    }
-    None
-}
-
 fn pick_row(label: &str, fi: u32, rows: Option<&Vec<MnfRow>>) -> Result<MnfRow, String> {
     match rows.map(|r| r.as_slice()) {
         None | Some([]) => Err(format!(
@@ -1130,36 +1029,29 @@ fn pick_row(label: &str, fi: u32, rows: Option<&Vec<MnfRow>>) -> Result<MnfRow, 
     }
 }
 
-fn copy_into(src: &Path, name: &str, out_dir: &Path) -> io::Result<String> {
-    fs::copy(src, out_dir.join(name))?;
-    Ok(name.to_string())
-}
-
-fn texture_out_name(mat_i: usize, tex_i: usize, role: Option<usize>, src: &Path) -> String {
-    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("dds").to_ascii_lowercase();
+fn texture_out_name(mat_i: usize, tex_i: usize, role: Option<usize>) -> String {
+    let ext = "dds";
     match (mat_i, role) {
         (0, Some(r)) => format!("{}.{}", SLOT_ROLES[r], ext),
         _ => format!("extra{}_{}.{}", mat_i, tex_i, ext),
     }
 }
 
-fn fix_dds_linear_size(path: &Path) -> io::Result<()> {
-    let mut d = fs::read(path)?;
+/// DDS files from the archive can carry a wrong linear size; fix it in place.
+fn fix_dds_linear_size(d: &mut [u8]) {
     if d.len() < 128 || &d[0..4] != b"DDS " {
-        return Ok(());
+        return;
     }
     let block = match &d[84..88] {
         b"DXT1" => 8u32,
         b"DXT3" | b"DXT5" => 16u32,
-        _ => return Ok(()),
+        _ => return,
     };
     let h = u32::from_le_bytes(d[12..16].try_into().unwrap());
     let w = u32::from_le_bytes(d[16..20].try_into().unwrap());
     let size = ((w + 3) / 4) * ((h + 3) / 4) * block;
     d[20..24].copy_from_slice(&size.to_le_bytes());
-    fs::write(path, d)
 }
-
 
 fn plain_abs(p: &Path) -> io::Result<PathBuf> {
     let c = fs::canonicalize(p)?;
@@ -1716,41 +1608,33 @@ pub fn run(model_fi: u32, o: &Options) -> Result<Summary, String> {
 /// When `skel` is given, a skinned `<index>.<rig_ext>` (mesh + bones + weights, written by Noesis; the format
 /// follows the extension, e.g. fbx, glb, dae, smd) is exported as well.
 pub fn run_with_textures(model_fi: u32, tex: Option<[u32; 3]>, skel: Option<u32>, rig_ext: &str, o: &Options) -> Result<Summary, String> {
-    let ctx = Ctx { o, prefer_file_index: Cell::new(false) };
-
     let mut want = HashSet::new();
     want.insert(model_fi);
-    let found = lookup_file_indexes(o.manifest, &want)
-        .map_err(|e| format!("Failed to read manifest '{}': {}", o.manifest, e))?;
+    let found = lookup_file_indexes(o.manifest, &want);
     let model = pick_row("Model", model_fi, found.get(&model_fi))?;
     println!(
         "Model: FileIndex 0x{:08X} -> Index {} (arch {}, {} bytes)",
         model_fi, model.index, model.arch, model.size
     );
 
-    let model_path = fetch(&ctx, &model, MODEL_EXTS);
     if o.dry_run {
         println!("\nDry run: stopping here (texture list needs the model file).");
         return Ok(Summary { out_dir: PathBuf::new(), textures_found: 0, textures_missing: 0 });
     }
-    let model_path = model_path.ok_or_else(|| {
-        format!(
-            "Model file '{}.gr2' not found under '{}'. Did the export run (see --skip-export)?",
-            model.index, o.temp_dir
-        )
-    })?;
-    let blob = fs::read(&model_path).map_err(|e| format!("Failed to read '{}': {}", model_path.display(), e))?;
-    if tex.is_none() && texture_refs(&blob).is_empty() {
+    let blob_rc = o.cache.get(o.archive, model.index)
+        .map_err(|e| format!("Model file (Index {}) could not be read: {}", model.index, e))?;
+    let blob: &[u8] = &blob_rc;
+    if tex.is_none() && texture_refs(blob).is_empty() {
         return Err(format!(
-            "No texture reference records found in '{}'. Is this a model .gr2 with the usual header table?",
-            model_path.display()
+            "No texture reference records found in model Index {}. Is this a model .gr2 with the usual header table?",
+            model.index
         ));
     }
-    let mats: Vec<MatDef> = match parse_materials_with(&blob, tex) {
+    let mats: Vec<MatDef> = match parse_materials_with(blob, tex) {
         Some(m) => m,
         None => {
             eprintln!("  Warning: could not read the material table of this .gr2; guessing material groups from the texture records (3 maps per material).");
-            materials_from_triples(&blob)
+            materials_from_triples(blob)
         }
     };
     report_duplicate_material_names(&mats);
@@ -1761,8 +1645,12 @@ pub fn run_with_textures(model_fi: u32, tex: Option<[u32; 3]>, skel: Option<u32>
     }
 
     let wanted: HashSet<u32> = mats.iter().flat_map(|m| m.maps.iter().map(|x| x.file_index)).collect();
-    let rows = lookup_file_indexes(o.manifest, &wanted)
-        .map_err(|e| format!("Failed to read manifest '{}': {}", o.manifest, e))?;
+    let rows = lookup_file_indexes(o.manifest, &wanted);
+
+    // One pass over the archive for every texture of this model (cached ones are skipped).
+    let mut tex_indices: Vec<u32> = wanted.iter().filter_map(|fi| rows.get(fi).and_then(|v| v.first()).map(|r| r.index)).collect();
+    tex_indices.sort_unstable();
+    o.cache.prefetch(o.archive, &tex_indices);
 
     // Everything goes into one flat folder, keeping the archive's own file names:
     //   <index>.gr2, <textureIndex>.dds / .png, <index>.obj, <index>.mtl
@@ -1770,20 +1658,20 @@ pub fn run_with_textures(model_fi: u32, tex: Option<[u32; 3]>, skel: Option<u32>
     let out_dir = o.out_root.to_path_buf();
     fs::create_dir_all(&out_dir)
         .map_err(|e| format!("Failed to create '{}': {}", out_dir.display(), e))?;
-    let model_name = copy_into(&model_path, &format!("{}.gr2", model.index), &out_dir)
-        .map_err(|e| format!("Failed to copy model: {}", e))?;
+    let model_name = format!("{}.gr2", model.index);
+    fs::write(out_dir.join(&model_name), blob)
+        .map_err(|e| format!("Failed to write model: {}", e))?;
     println!("Model -> {}", out_dir.join(&model_name).display());
 
     if let Some(sk) = skel.filter(|s| *s != 0) {
         let want: HashSet<u32> = [sk].into_iter().collect();
-        let res = lookup_file_indexes(o.manifest, &want)
-            .map_err(|e| e.to_string())
-            .and_then(|found| pick_row("Skeleton", sk, found.get(&sk)))
-            .and_then(|row| {
-                let src = fetch(&ctx, &row, MODEL_EXTS)
-                    .ok_or_else(|| format!("Index {} was not produced by the exporter", row.index))?;
-                copy_into(&src, &format!("{}.gr2", row.index), &out_dir).map_err(|e| e.to_string())
-            });
+        let found = lookup_file_indexes(o.manifest, &want);
+        let res = pick_row("Skeleton", sk, found.get(&sk)).and_then(|row| {
+            let b = o.cache.get(o.archive, row.index)?;
+            let name = format!("{}.gr2", row.index);
+            fs::write(out_dir.join(&name), b.as_slice()).map_err(|e| e.to_string())?;
+            Ok(name)
+        });
         match res {
             Ok(name) => println!("Skeleton -> {}", out_dir.join(&name).display()),
             Err(e) => eprintln!("  Warning: skeleton 0x{:08X} not exported: {}", sk, e),
@@ -1791,12 +1679,12 @@ pub fn run_with_textures(model_fi: u32, tex: Option<[u32; 3]>, skel: Option<u32>
     }
 
     // Noesis' GR2 plugin wants the textures next to the model under fixed role names
-    // (diffuse/normal/specular), so it gets a private scratch folder.
-    let scratch = out_dir.join(format!("_noesis_tmp_{}", model.index));
-    fs::create_dir_all(&scratch)
-        .map_err(|e| format!("Failed to create '{}': {}", scratch.display(), e))?;
-    fs::copy(out_dir.join(&model_name), scratch.join(&model_name))
-        .map_err(|e| format!("Failed to copy model to scratch: {}", e))?;
+    // (diffuse/normal/specular), so it gets a private scratch folder (removed when it goes out of scope).
+    let scratch_guard = Scratch::new(&format!("model_{}", model.index))
+        .map_err(|e| format!("Failed to create scratch folder: {}", e))?;
+    let scratch = scratch_guard.path().to_path_buf();
+    fs::write(scratch.join(&model_name), blob)
+        .map_err(|e| format!("Failed to write model to scratch: {}", e))?;
 
     // PNG name per material, per role (diffuse/normal/specular), used by the .mtl.
     let mut mat_png: Vec<MatPng> = mats
@@ -1822,43 +1710,36 @@ pub fn run_with_textures(model_fi: u32, tex: Option<[u32; 3]>, skel: Option<u32>
                 continue;
             }
         };
-        match fetch(&ctx, &row, TEXTURE_EXTS) {
-            Some(src) => {
-                // keep the original file name (e.g. 608841.dds)
-                let orig = src.file_name().and_then(|n| n.to_str()).unwrap_or("texture.dds").to_ascii_lowercase();
-                match copy_into(&src, &orig, &out_dir) {
-                    Ok(name) => {
-                        if name.ends_with(".dds") {
-                            if let Err(e) = fix_dds_linear_size(&out_dir.join(&name)) {
-                                eprintln!("  Warning: could not fix DDS header of {}: {}", name, e);
-                            }
-                            let png_name = name.replace(".dds", ".png");
-                            match image::open(out_dir.join(&name)) {
-                                Ok(img) => match img.save(out_dir.join(&png_name)) {
-                                    Ok(()) => {
-                                        if let Some(r) = role {
-                                            if mat_png[mat_i].png[r].is_none() {
-                                                mat_png[mat_i].png[r] = Some(png_name.clone());
-                                            }
-                                        }
-                                    }
-                                    Err(e) => eprintln!("  Warning: PNG save failed for {}: {}", name, e),
-                                },
-                                Err(e) => eprintln!("  Warning: could not decode {} to PNG: {}", name, e),
+        let dds = o.cache.get(o.archive, row.index).and_then(|b| archive::dds_from_bytes(b.as_ref().clone()));
+        match dds {
+            Ok(mut data) => {
+                fix_dds_linear_size(&mut data);
+                let name = format!("{}.dds", row.index);
+                if let Err(e) = fs::write(out_dir.join(&name), &data) {
+                    eprintln!("  slot {}: write failed: {}", slot, e);
+                    missing += 1;
+                    continue;
+                }
+                let png_name = format!("{}.png", row.index);
+                match image::load_from_memory(&data) {
+                    Ok(img) => match img.save(out_dir.join(&png_name)) {
+                        Ok(()) => {
+                            if let Some(r) = role {
+                                if mat_png[mat_i].png[r].is_none() {
+                                    mat_png[mat_i].png[r] = Some(png_name.clone());
+                                }
                             }
                         }
-                        let _ = fs::copy(out_dir.join(&name), scratch.join(texture_out_name(mat_i, tex_i, role, &src)));
-                        println!("  '{}' {}: 0x{:08X} -> {}", mats[mat_i].name, usage, fi, name);
-                        ok += 1;
-                    }
-                    Err(e) => {
-                        eprintln!("  slot {}: copy failed: {}", slot, e);
-                        missing += 1;
-                    }
+                        Err(e) => eprintln!("  Warning: PNG save failed for {}: {}", name, e),
+                    },
+                    Err(e) => eprintln!("  Warning: could not decode {} to PNG: {}", name, e),
                 }
+                let _ = fs::write(scratch.join(texture_out_name(mat_i, tex_i, role)), &data);
+                println!("  '{}' {}: 0x{:08X} -> {}", mats[mat_i].name, usage, fi, name);
+                ok += 1;
             }
-            None => {
-                eprintln!("  slot {}: 0x{:08X} (Index {}) was not produced by the exporter", slot, fi, row.index);
+            Err(e) => {
+                eprintln!("  slot {}: 0x{:08X} (Index {}) could not be read: {}", slot, fi, row.index, e);
                 missing += 1;
             }
         }
@@ -1871,9 +1752,9 @@ pub fn run_with_textures(model_fi: u32, tex: Option<[u32; 3]>, skel: Option<u32>
     });
     match result {
         Ok(scratch_obj) => {
-            let groups = tri_material_groups(&blob);
-            let uvs = mesh_uvs(&blob);
-            let (infos, skeleton) = mesh_infos(&blob).unwrap_or_default();
+            let groups = tri_material_groups(blob);
+            let uvs = mesh_uvs(blob);
+            let (infos, skeleton) = mesh_infos(blob).unwrap_or_default();
             let variants = resolve_variants(&infos, &skeleton);
             if !variants.is_empty() {
                 let list: Vec<String> = variants.iter().map(|(l, m)| format!("{} ({})", l, m)).collect();
@@ -1902,7 +1783,7 @@ pub fn run_with_textures(model_fi: u32, tex: Option<[u32; 3]>, skel: Option<u32>
         Err(e) => eprintln!("Warning: obj export failed: {}", e),
     }
     if skel.is_some() {
-        let n_bones = mesh_infos(&blob).map(|(_, s)| s.len()).unwrap_or(0);
+        let n_bones = mesh_infos(blob).map(|(_, s)| s.len()).unwrap_or(0);
         println!("  The model file embeds a skeleton of {} bone(s).", n_bones);
         let fbx_res = plain_abs(&scratch.join(&model_name)).and_then(|src| {
             let fbx = src.with_extension(rig_ext);
@@ -1920,78 +1801,11 @@ pub fn run_with_textures(model_fi: u32, tex: Option<[u32; 3]>, skel: Option<u32>
             Err(e) => eprintln!("Warning: .{} export failed (does this Noesis build export that format?): {}", rig_ext, e),
         }
     }
-    let _ = fs::remove_dir_all(&scratch);
-
-    if !o.keep_temp && !o.skip_export {
-        invalidate_index();
-        if let Err(e) = fs::remove_dir_all(o.temp_dir) {
-            eprintln!("Warning: failed to remove temporary directory '{}': {}", o.temp_dir, e);
-        }
-    }
+    drop(scratch_guard);
+    o.cache.trim(CACHE_LIMIT);
 
     Ok(Summary { out_dir, textures_found: ok, textures_missing: missing })
 }
-
-fn prefetch(ids: &[u32], o: &Options) -> Result<(), String> {
-    let want: HashSet<u32> = ids.iter().copied().collect();
-    let rows = lookup_file_indexes(o.manifest, &want)
-        .map_err(|e| format!("Failed to read manifest '{}': {}", o.manifest, e))?;
-
-    let mut keep: HashSet<u32> = HashSet::new();
-    let mut model_idx: Vec<u32> = Vec::new();
-    let mut model_archs: BTreeSet<u32> = BTreeSet::new();
-    for id in ids {
-        if let Some(r) = rows.get(id).and_then(|v| v.first()) {
-            keep.insert(r.index);
-            model_idx.push(r.index);
-            model_archs.insert(r.arch);
-        }
-    }
-
-    let dump_and_prune = |arch: u32, keep: &HashSet<u32>| {
-        println!("\nExporting archive {} (one pass)...", arch);
-        if !export::export_archive(o.exe, o.mnf, o.temp_dir, arch, false) {
-            eprintln!("Archive {} export reported an error; check output above.", arch);
-        }
-        let (kept, removed) = export::cleanup_export_dir(o.temp_dir, keep, false);
-        println!("  Pruned archive {}: kept {} files total, removed {}.", arch, kept, removed);
-        invalidate_index();
-    };
-
-    for a in &model_archs {
-        dump_and_prune(*a, &keep);
-    }
-
-    let temp = Path::new(o.temp_dir);
-    let mut tex_fis: HashSet<u32> = HashSet::new();
-    for idx in &model_idx {
-        let Some(p) = find_by_stem(temp, *idx, MODEL_EXTS) else { continue };
-        let Ok(blob) = fs::read(&p) else { continue };
-        let mats = parse_materials(&blob).unwrap_or_else(|| materials_from_triples(&blob));
-        for m in &mats {
-            for x in &m.maps {
-                tex_fis.insert(x.file_index);
-            }
-        }
-    }
-    let tex_rows = lookup_file_indexes(o.manifest, &tex_fis)
-        .map_err(|e| format!("Failed to read manifest '{}': {}", o.manifest, e))?;
-    let mut tex_archs: BTreeSet<u32> = BTreeSet::new();
-    for fi in &tex_fis {
-        if let Some(r) = tex_rows.get(fi).and_then(|v| v.first()) {
-            keep.insert(r.index);
-            tex_archs.insert(r.arch);
-        }
-    }
-    println!("\n{} model(s) reference {} distinct texture(s) in {} archive(s).", model_idx.len(), tex_fis.len(), tex_archs.len());
-
-    for a in &tex_archs {
-        dump_and_prune(*a, &keep);
-    }
-    Ok(())
-}
-
-const SMALL_BATCH: usize = 10;
 
 /// Name of the first mesh in a model .gr2 that has one (the same name Noesis uses for the OBJ group).
 pub fn mesh_name(blob: &[u8]) -> Option<String> {
@@ -2011,84 +1825,38 @@ pub fn mesh_name(blob: &[u8]) -> Option<String> {
     None
 }
 
-/// Mesh name of each model in `ids` (MNF FileIndexes), read from the model's .gr2. Like `run_batch`, 10 or more
-/// models are fetched by exporting each whole archive once (then pruned to the wanted files); fewer are fetched
-/// file by file. Models that can't be exported or read are simply left out of the result. Needs no Noesis.
+/// Mesh name of each model in `ids` (MNF FileIndexes), read from the model's .gr2. All models are read in one pass over
+/// the archive and dropped as soon as their name is taken. Models that can't be read are simply left out of the
+/// result. Needs no Noesis.
 pub fn mesh_names(ids: &[u32], o: &Options) -> HashMap<u32, String> {
     let mut out = HashMap::new();
     if o.dry_run || ids.is_empty() {
         return out;
     }
     let want: HashSet<u32> = ids.iter().copied().collect();
-    let rows = match lookup_file_indexes(o.manifest, &want) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("Failed to read manifest '{}': {}", o.manifest, e);
-            return out;
-        }
-    };
-    let mut by_arch: BTreeMap<u32, Vec<(u32, MnfRow)>> = BTreeMap::new();
-    let mut sorted: Vec<u32> = want.iter().copied().collect();
-    sorted.sort_unstable();
+    let rows = lookup_file_indexes(o.manifest, &want);
+    let mut by_index: HashMap<u32, Vec<u32>> = HashMap::new(); // entry index -> model ids
     let mut not_in_manifest = 0usize;
-    for id in sorted {
-        match rows.get(&id).and_then(|v| v.first()) {
-            Some(r) => by_arch.entry(r.arch).or_default().push((id, r.clone())),
+    for id in &want {
+        match rows.get(id).and_then(|v| v.first()) {
+            Some(r) => by_index.entry(r.index).or_default().push(*id),
             None => not_in_manifest += 1,
         }
     }
-    let total: usize = by_arch.values().map(Vec::len).sum();
-    let whole_archives = total >= SMALL_BATCH && !o.skip_export;
-    if whole_archives {
-        println!("{} model(s) in {} archive(s): exporting whole archives.", total, by_arch.len());
-    } else if !o.skip_export {
-        println!("{} model(s): exporting individual files instead of whole archives.", total);
-    }
+    let mut wanted: Vec<u32> = by_index.keys().copied().collect();
+    wanted.sort_unstable();
+    println!("{} model(s): reading them in one pass.", wanted.len());
 
-    let inner = Options {
-        manifest: o.manifest,
-        exe: o.exe,
-        mnf: o.mnf,
-        temp_dir: o.temp_dir,
-        out_root: o.out_root,
-        dry_run: false,
-        skip_export: o.skip_export || whole_archives,
-        keep_temp: true,
-        noesis: o.noesis,
-    };
-    let ctx = Ctx { o: &inner, prefer_file_index: Cell::new(false) };
     let mut unreadable = 0usize;
-    for (k, (arch, list)) in by_arch.iter().enumerate() {
-        if whole_archives {
-            println!("\n[{}/{}] Archive {}: {} model(s)", k + 1, by_arch.len(), arch, list.len());
-            if !export::export_archive(o.exe, o.mnf, o.temp_dir, *arch, false) {
-                eprintln!("  Archive {} export reported an error; its models may stay unnamed.", arch);
-            }
-            let keep: HashSet<u32> = list.iter().map(|(_, r)| r.index).collect();
-            let (kept, removed) = export::cleanup_export_dir(o.temp_dir, &keep, false);
-            println!("  Pruned archive {}: kept {} files, removed {}.", arch, kept, removed);
-            invalidate_index();
-        }
-        for (id, row) in list {
-            let name = fetch(&ctx, row, MODEL_EXTS)
-                .and_then(|p| fs::read(p).ok())
-                .and_then(|blob| mesh_name(&blob));
-            match name {
-                Some(n) => {
-                    out.insert(*id, n);
-                }
+    o.archive.read_each(&wanted, |e, data| {
+        let name = data.ok().and_then(|blob| mesh_name(&blob));
+        for id in by_index.get(&e.index).into_iter().flatten() {
+            match &name {
+                Some(n) => { out.insert(*id, n.clone()); }
                 None => unreadable += 1,
             }
         }
-        if whole_archives && !o.keep_temp {
-            invalidate_index();
-            let _ = fs::remove_dir_all(o.temp_dir);
-        }
-    }
-    if !o.keep_temp && !o.skip_export {
-        invalidate_index();
-        let _ = fs::remove_dir_all(o.temp_dir);
-    }
+    });
     println!(
         "Mesh names: {} of {} model(s) named ({} not in the manifest, {} without a readable mesh name).",
         out.len(), ids.len(), not_in_manifest, unreadable
@@ -2097,38 +1865,20 @@ pub fn mesh_names(ids: &[u32], o: &Options) -> HashMap<u32, String> {
 }
 
 pub fn run_batch(ids: &[u32], o: &Options) -> Vec<(u32, Result<Summary, String>)> {
-    let mut prefetched = false;
-    let small = ids.len() < SMALL_BATCH;
-    if small && !ids.is_empty() && !o.dry_run && !o.skip_export {
-        println!("{} model(s): exporting individual files instead of whole archives.", ids.len());
+    if !o.dry_run && !ids.is_empty() {
+        // All model files in one pass; textures are read per model (and kept while shared).
+        let want: HashSet<u32> = ids.iter().copied().collect();
+        let rows = lookup_file_indexes(o.manifest, &want);
+        let mut idx: Vec<u32> = ids.iter().filter_map(|id| rows.get(id).and_then(|v| v.first()).map(|r| r.index)).collect();
+        idx.sort_unstable();
+        idx.dedup();
+        println!("{} model(s): reading the model files in one pass.", idx.len());
+        o.cache.prefetch(o.archive, &idx);
     }
-    if !small && !o.dry_run && !o.skip_export && !ids.is_empty() {
-        match prefetch(ids, o) {
-            Ok(()) => prefetched = true,
-            Err(e) => eprintln!("Batch export failed ({}); falling back to per-file extraction.", e),
-        }
-    }
-    let inner = Options {
-        manifest: o.manifest,
-        exe: o.exe,
-        mnf: o.mnf,
-        temp_dir: o.temp_dir,
-        out_root: o.out_root,
-        dry_run: o.dry_run,
-        skip_export: o.skip_export || prefetched,
-        keep_temp: true,
-        noesis: o.noesis,
-    };
     let mut results = Vec::with_capacity(ids.len());
     for (n, id) in ids.iter().enumerate() {
         println!("\n=== Model {}/{}: 0x{:x} ===", n + 1, ids.len(), id);
-        results.push((*id, run(*id, &inner)));
-    }
-    if !o.keep_temp && !o.skip_export && !o.dry_run {
-        invalidate_index();
-        if let Err(e) = fs::remove_dir_all(o.temp_dir) {
-            eprintln!("Warning: failed to remove temporary directory '{}': {}", o.temp_dir, e);
-        }
+        results.push((*id, run(*id, o)));
     }
     results
 }

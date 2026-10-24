@@ -141,8 +141,8 @@ fn parse_rtree_node(buf: &[u8], off: usize) -> (Value, usize) {
     }
 }
 
-pub fn parse_file(path: &Path) -> io::Result<Value> {
-    let buf = fs::read(path)?;
+pub fn parse_bytes(buf: &[u8]) -> io::Result<Value> {
+    let buf = buf.to_vec();
 
     let header_val = parse_file_header(&buf, 0);
     let instance_count = header_val["instance_count"].as_u64().unwrap_or(0) as usize;
@@ -181,10 +181,10 @@ pub fn parse_file(path: &Path) -> io::Result<Value> {
 }
 
 
-pub fn parse_and_write(input: &Path, output: &Path) -> io::Result<()> {
-    let value = parse_file(input)?;
+pub fn parse_and_write(input: &[u8], output: &Path) -> io::Result<()> {
+    let value = parse_bytes(input)?;
     let s = serde_json::to_string_pretty(&value)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     fs::write(output, s)?;
     Ok(())
-}
+}

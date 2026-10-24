@@ -209,11 +209,6 @@ pub fn parse_bytes(b: &[u8]) -> Result<LodFile, String> {
     Ok(out)
 }
 
-pub fn parse_file(path: &Path) -> io::Result<LodFile> {
-    let b = fs::read(path)?;
-    parse_bytes(&b).map_err(|e| bad(format!("{}: {}", path.display(), e)))
-}
-
 /// Writes one section as a Wavefront OBJ. Vertices are placed in world units so neighbouring blocks line up when
 /// imported together: `X = (cell_x * 64 + x) * cell_size / 64`, `Z` likewise, `Y` = height.
 /// Grid triangles go in `g terrain`, skirt triangles in `g skirt` (or are left out with `skirts == false`).
@@ -261,17 +256,17 @@ pub fn write_obj(sec: &Section, cell_x: u32, cell_z: u32, cell_size: f64, skirts
 
 /// Parses one exported `.dat` and writes `<out_dir>/lod_x<X>_z<Z>_ch<N>.obj` for every record that parses.
 /// Returns the files written; `Err` only if nothing could be written.
-pub fn export_file(path: &Path, cell_x: u32, cell_z: u32, cell_size: f64, skirts: bool, out_dir: &Path) -> io::Result<Vec<PathBuf>> {
-    let lf = parse_file(path)?;
+pub fn export_file(bytes: &[u8], label: &str, cell_x: u32, cell_z: u32, cell_size: f64, skirts: bool, out_dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let lf = parse_bytes(bytes).map_err(|e| bad(format!("{}: {}", label, e)))?;
     let expected = (cell_x << 16) | cell_z;
     if lf.file_index != expected {
         eprintln!(
             "\tWarning: '{}' header says cell 0x{:08X}, manifest says 0x{:08X}; using the manifest.",
-            path.display(), lf.file_index, expected
+            label, lf.file_index, expected
         );
     }
     for (ch, why) in &lf.skipped {
-        eprintln!("\tWarning: '{}' record for channel {} skipped: {}", path.display(), ch, why);
+        eprintln!("\tWarning: '{}' record for channel {} skipped: {}", label, ch, why);
     }
     let mut written = Vec::new();
     for sec in &lf.sections {
@@ -280,7 +275,7 @@ pub fn export_file(path: &Path, cell_x: u32, cell_z: u32, cell_size: f64, skirts
         written.push(out);
     }
     if written.is_empty() {
-        return Err(bad(format!("{}: no usable mesh record", path.display())));
+        return Err(bad(format!("{}: no usable mesh record", label)));
     }
     Ok(written)
-}
+}

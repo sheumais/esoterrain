@@ -70,10 +70,10 @@ fn le_f32(b: &[u8], o: usize) -> f32 {
     f32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]])
 }
 
-pub fn parse(path: &Path) -> Result<Vec<TerrainTexture>, String> {
-    let d = std::fs::read(path).map_err(|e| format!("failed to read '{}': {}", path.display(), e))?;
+pub fn parse(d: &[u8]) -> Result<Vec<TerrainTexture>, String> {
+    let d = d.to_vec();
     if d.len() < FILE_HEADER_LEN || d[0..4] != MAGIC {
-        return Err(format!("'{}' is not an EsoFileData table (bad magic).", path.display()));
+        return Err("the terrain texture table is not an EsoFileData table (bad magic).".to_string());
     }
     let count = be32(&d, 8) as usize;
     let mut out = Vec::with_capacity(count);
@@ -233,19 +233,6 @@ pub fn scan_files(dir: &Path, wanted: &BTreeSet<u32>) -> HashMap<u32, PathBuf> {
     found
 }
 
-/// Copy the wanted manifest Indexes found under `scan_dir` into `dest`. Returns how many were copied.
-pub fn copy_found(scan_dir: &Path, wanted: &BTreeSet<u32>, dest: &Path) -> Result<usize, String> {
-    std::fs::create_dir_all(dest).map_err(|e| format!("failed to create '{}': {}", dest.display(), e))?;
-    let mut copied = 0usize;
-    for (idx, src) in scan_files(scan_dir, wanted) {
-        let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("dds");
-        let to = dest.join(format!("{}.{}", idx, ext));
-        std::fs::copy(&src, &to).map_err(|e| format!("failed to copy '{}' -> '{}': {}", src.display(), to.display(), e))?;
-        copied += 1;
-    }
-    Ok(copied)
-}
-
 /// FileIndex -> file name for the textures already present in `dest`.
 /// `fi_to_index` maps each texture FileIndex to its manifest Index.
 pub fn exported_names(dest: &Path, fi_to_index: &BTreeMap<u32, u32>) -> HashMap<u32, String> {
@@ -261,4 +248,4 @@ pub fn exported_names(dest: &Path, fi_to_index: &BTreeMap<u32, u32>) -> HashMap<
                 .map(|n| (*fi, n.to_string()))
         })
         .collect()
-}
+}

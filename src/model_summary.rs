@@ -14,6 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{self, BufWriter, Write};
 use std::path::Path;
 
+use crate::archive::{Archive, MANIFEST_HEADER};
 use crate::manifest::parse_int;
 
 struct Usage {
@@ -65,30 +66,15 @@ fn scan_world_luts(dir: &Path) -> io::Result<(HashMap<u32, Usage>, usize)> {
     Ok((usage, files.len()))
 }
 
-/// One pass over the manifest, keeping only rows whose Unk1 + FileIndex is a wanted model id.
+/// One pass over the entries, keeping only rows whose Unk1 + FileIndex is a wanted model id.
 fn collect_manifest_rows(
-    manifest_path: &str,
+    archive: &Archive,
     wanted: &HashMap<u32, Usage>,
-) -> io::Result<(String, HashMap<u32, Vec<ManifestRow>>)> {
-    let content = std::fs::read_to_string(manifest_path)?;
-    let mut header = String::new();
+) -> (String, HashMap<u32, Vec<ManifestRow>>) {
     let mut rows: HashMap<u32, Vec<ManifestRow>> = HashMap::new();
 
-    for (n, raw) in content.lines().enumerate() {
-        let line = raw.trim_end_matches('\r');
-        if n == 0 {
-            header = line.to_string();
-        }
-        // The filename column may itself contain commas, so only split off the first 11 fields.
-        let row: Vec<&str> = line.splitn(12, ',').map(|c| c.trim()).collect();
-        if row.len() < 11 {
-            continue;
-        }
-        let (index, file_index, unk1) = match (parse_int(row[0]), parse_int(row[2]), parse_int(row[3])) {
-            (Some(i), Some(f), Some(u)) => (i, f, u),
-            _ => continue,
-        };
-        let key = unk1 + file_index;
+    for e in archive.entries() {
+        let key = e.unknown1 as i64 + e.file_index as i64;
         if key < 0 || key > u32::MAX as i64 {
             continue;
         }
@@ -97,18 +83,18 @@ fn collect_manifest_rows(
             continue;
         }
         rows.entry(key).or_default().push(ManifestRow {
-            line: line.to_string(),
-            index,
-            arch: parse_int(row[9]).unwrap_or(-1),
-            size: parse_int(row[4]).unwrap_or(-1),
-            file_index,
-            unk1,
+            line: archive.manifest_line(e),
+            index: e.index as i64,
+            arch: e.archive_index as i64,
+            size: e.size as i64,
+            file_index: e.file_index as i64,
+            unk1: e.unknown1 as i64,
         });
     }
-    Ok((header, rows))
+    (MANIFEST_HEADER.to_string(), rows)
 }
 
-pub fn run(worlds_dir: &Path, manifest_path: &str, out_dir: &Path) -> Result<(), String> {
+pub fn run(worlds_dir: &Path, archive: &Archive, out_dir: &Path) -> Result<(), String> {
     let (usage, n_files) = scan_world_luts(worlds_dir)
         .map_err(|e| format!("failed to read world LUTs in '{}': {}", worlds_dir.display(), e))?;
     if n_files == 0 {
@@ -119,8 +105,7 @@ pub fn run(worlds_dir: &Path, manifest_path: &str, out_dir: &Path) -> Result<(),
     }
     println!("Read {} world LUT file(s): {} distinct model ids.", n_files, usage.len());
 
-    let (header, rows) = collect_manifest_rows(manifest_path, &usage)
-        .map_err(|e| format!("failed to read manifest '{}': {}", manifest_path, e))?;
+    let (header, rows) = collect_manifest_rows(archive, &usage);
 
     std::fs::create_dir_all(out_dir).map_err(|e| format!("failed to create '{}': {}", out_dir.display(), e))?;
     let summary_path = out_dir.join("model_usage_summary.csv");
@@ -187,4 +172,4 @@ pub fn run(worlds_dir: &Path, manifest_path: &str, out_dir: &Path) -> Result<(),
         println!("{} model id(s) match more than one manifest row (all kept in the entries file).", ambiguous);
     }
     Ok(())
-}
+}

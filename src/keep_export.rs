@@ -17,8 +17,8 @@ pub const KEEPS_FILE_INDEX: u32 = 0x5a;
 pub const PIECES_FILE_INDEX: u32 = 0x5b;
 
 pub struct KeepArgs<'a> {
-    pub keeps_file: &'a Path,
-    pub pieces_file: &'a Path,
+    pub keeps_data: &'a [u8],
+    pub pieces_data: &'a [u8],
     pub cell_m: f64,
     pub units_per_metre: f64,
     pub only_key: Option<u32>,
@@ -84,10 +84,9 @@ fn split_rows<'a>(data: &'a [u8], what: &str) -> Result<Vec<&'a [u8]>, String> {
     Ok(rows)
 }
 
-fn parse_pieces(path: &Path) -> Result<HashMap<i32, u32>, String> {
-    let data = fs::read(path).map_err(|e| format!("Failed to read '{}': {}", path.display(), e))?;
+fn parse_pieces(data: &[u8]) -> Result<HashMap<i32, u32>, String> {
     let mut map = HashMap::new();
-    for row in split_rows(&data, "pieces (1146)")? {
+    for row in split_rows(data, "pieces (1146)")? {
         let key = be_i32(row, 32)?;
         let model = be_u32(row, PIECE_MODEL_OFF)?;
         if model != 0 {
@@ -97,10 +96,9 @@ fn parse_pieces(path: &Path) -> Result<HashMap<i32, u32>, String> {
     Ok(map)
 }
 
-fn parse_keeps(path: &Path) -> Result<Vec<Keep>, String> {
-    let data = fs::read(path).map_err(|e| format!("Failed to read '{}': {}", path.display(), e))?;
+fn parse_keeps(data: &[u8]) -> Result<Vec<Keep>, String> {
     let mut keeps = Vec::new();
-    for row in split_rows(&data, "keeps (1144)")? {
+    for row in split_rows(data, "keeps (1144)")? {
         let key = be_u32(row, 32)?;
         let world = be_u32(row, KEEP_WORLD_OFF)?;
         let pos_cm = [
@@ -134,8 +132,8 @@ fn parse_keeps(path: &Path) -> Result<Vec<Keep>, String> {
     Ok(keeps)
 }
 
-pub fn write_lut(keeps_file: &Path, out_path: &Path) -> Result<usize, String> {
-    let mut keeps = parse_keeps(keeps_file)?;
+pub fn write_lut(keeps_data: &[u8], out_path: &Path) -> Result<usize, String> {
+    let mut keeps = parse_keeps(keeps_data)?;
     keeps.sort_by_key(|k| k.key);
 
     let mut out = String::from("key,world,grid,pos_x_cm,pos_y_cm,pos_z_cm,heading_deg,pieces\n");
@@ -156,8 +154,8 @@ pub fn write_lut(keeps_file: &Path, out_path: &Path) -> Result<usize, String> {
 }
 
 pub fn run(a: &KeepArgs) -> Result<PathBuf, String> {
-    let pieces = parse_pieces(a.pieces_file)?;
-    let keeps = parse_keeps(a.keeps_file)?;
+    let pieces = parse_pieces(a.pieces_data)?;
+    let keeps = parse_keeps(a.keeps_data)?;
     println!("Read {} keep(s), {} piece model(s).", keeps.len(), pieces.len());
 
     let mut out = String::from("{\"instances\":[\n");
@@ -231,4 +229,4 @@ pub fn run(a: &KeepArgs) -> Result<PathBuf, String> {
         n_keeps, n_inst, n_unknown, a.out_file.display()
     );
     Ok(a.out_file.to_path_buf())
-}
+}

@@ -1,4 +1,4 @@
-use crate::reader::BinReader;
+type BinReader<'a> = eso_common::ByteReader<std::io::Cursor<&'a [u8]>>;
 use image::{ImageBuffer, Luma, Rgb};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -50,33 +50,32 @@ impl LandFile {
         }
     }
 
-    pub fn is_land_file<P: AsRef<Path>>(path: P) -> bool {
-        match BinReader::open(&path).and_then(|mut r| r.read_u32()) {
-            Ok(magic) => magic == MAGIC_HEADER,
-            Err(_) => false,
+    /// Parses a land data file from memory. `Ok(None)` when the magic does not match (not a land file);
+    /// `label` is only used in warnings.
+    pub fn from_bytes(data: &[u8], label: &str) -> io::Result<Option<LandFile>> {
+        if data.len() < 4 || u32::from_le_bytes([data[0], data[1], data[2], data[3]]) != MAGIC_HEADER {
+            return Ok(None);
         }
+        let mut file = LandFile::new();
+        file.filename = PathBuf::from(label);
+        let mut reader = BinReader::new(std::io::Cursor::new(data));
+
+        file.read_header(&mut reader)?;
+        file.data = vec![LandData::default(); file.header.num_records as usize];
+
+        for i in 0..file.header.num_records as usize {
+            file.read_data_section(&mut reader, i)?;
+        }
+
+        file.warn_on_duplicate_or_unknown_channels();
+
+        Ok(Some(file))
     }
 
-    pub fn load<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
-        self.filename = path.as_ref().to_path_buf();
-        let mut reader = BinReader::open(&path)?;
-
-        self.read_header(&mut reader)?;
-        self.data = vec![LandData::default(); self.header.num_records as usize];
-
-        for i in 0..self.header.num_records as usize {
-            self.read_data_section(&mut reader, i)?;
-        }
-
-        self.warn_on_duplicate_or_unknown_channels();
-
-        Ok(())
-    }
-
-    fn read_header(&mut self, reader: &mut BinReader) -> io::Result<()> {
+    fn read_header(&mut self, reader: &mut BinReader<'_>) -> io::Result<()> {
         let h = &mut self.header;
 
-        h.magic = reader.read_u32()?;
+        h.magic = reader.read_dword_le()?;
         if h.magic != MAGIC_HEADER {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -84,9 +83,9 @@ impl LandFile {
             ));
         }
 
-        h.unknown1 = reader.read_u8()?;
-        h.magic2 = reader.read_u32()?;
-        h.num_records = reader.read_u8()?;
+        h.unknown1 = reader.read_byte()?;
+        h.magic2 = reader.read_dword_le()?;
+        h.num_records = reader.read_byte()?;
 
         if h.num_records != 10 {
             eprintln!(
@@ -98,15 +97,15 @@ impl LandFile {
         h.rec_infos = Vec::with_capacity(h.num_records as usize);
         for _ in 0..h.num_records {
             h.rec_infos.push(RecInfo {
-                channel: reader.read_u8()?,
-                offset: reader.read_u32()?,
-                length: reader.read_u32()?,
+                channel: reader.read_byte()?,
+                offset: reader.read_dword_le()?,
+                length: reader.read_dword_le()?,
             });
         }
 
-        h.unknown2 = reader.read_u16()?;
+        h.unknown2 = reader.read_word_le()?;
         for i in 0..UNKNOWN3_SIZE {
-            h.unknown3[i] = reader.read_u32()?;
+            h.unknown3[i] = reader.read_dword_le()?;
         }
 
         Ok(())
@@ -130,10 +129,10 @@ impl LandFile {
         })?;
 
         let mut data = LandData::default();
-        data.magic = reader.read_u32()?;
-        data.height = reader.read_u32()?;
-        data.height2 = reader.read_u32()?;
-        data.width = reader.read_u32()?;
+        data.magic = reader.read_dword_le()?;
+        data.height = reader.read_dword_le()?;
+        data.height2 = reader.read_dword_le()?;
+        data.width = reader.read_dword_le()?;
 
         if data.height != data.height2 {
             eprintln!(
@@ -154,7 +153,7 @@ impl LandFile {
         data.data = vec![0u32; data_size / 4];
 
         for y in 0..data.height as usize {
-            let width = reader.read_u16()? as u32;
+            let width = reader.read_word_le()? as u32;
             if width != data.width {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -166,11 +165,11 @@ impl LandFile {
             }
 
             for x in 0..(data.width as usize) / 4 {
-                data.data[x + y * (data.width as usize) / 4] = reader.read_u32()?;
+                data.data[x + y * (data.width as usize) / 4] = reader.read_dword_le()?;
             }
         }
 
-        data.footer = reader.read_u32()?;
+        data.footer = reader.read_dword_le()?;
         self.data[index] = data;
         Ok(())
     }
@@ -646,4 +645,4 @@ impl RawBigImage {
             pixels, self.dim_x, self.dim_y,
         )
     }
-}
+}

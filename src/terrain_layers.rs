@@ -158,38 +158,89 @@ fn id_colour(id: u32) -> [u8; 3] {
     [(h & 0xFF) as u8 | 0x40, ((h >> 8) & 0xFF) as u8 | 0x40, ((h >> 16) & 0xFF) as u8 | 0x40]
 }
 
+/// Which layer ids also get their own full-size mask image (`k<kind>_layers/id_<id>.png`).
+#[derive(Default, Clone)]
+pub struct Split {
+    /// `None` = no split requested; `Some(empty)` = every kind; `Some(list)` = those kinds.
+    pub kinds: Option<Vec<u32>>,
+    /// `(kind, id)` pairs; when non-empty only these ids are written.
+    pub only: Vec<(u32, u32)>,
+}
+
+impl Split {
+    fn wants(&self, kind: u32, id: u32) -> bool {
+        let kind_ok = match &self.kinds {
+            Some(k) => k.is_empty() || k.contains(&kind),
+            None => !self.only.is_empty(),
+        };
+        kind_ok && (self.only.is_empty() || self.only.contains(&(kind, id)))
+    }
+}
+
+type IdMasks = BTreeMap<u32, Vec<(u32, u32, Vec<u8>)>>; // id -> (bx, bz, 1-bit mask)
+
+fn write_split(kind: u32, masks: &IdMasks, (tw, th): (usize, usize), (cw, ch): (usize, usize), (min_bx, min_bz): (u32, u32),
+               names: &HashMap<u32, String>, out_dir: &Path) -> Result<(), String> {
+    let dir = out_dir.join(format!("k{}_layers", kind));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create '{}': {}", dir.display(), e))?;
+    let csv = dir.join("index.csv");
+    let mut f = BufWriter::new(File::create(&csv).map_err(|e| format!("failed to create '{}': {}", csv.display(), e))?);
+    let io = |e: std::io::Error| format!("failed to write '{}': {}", csv.display(), e);
+    // The viewer reads columns 0-4 and the name from column 10.
+    writeln!(f, "layer_id,r,g,b,pixels,x0,y0,x1,y1,blocks,name").map_err(io)?;
+    let mut written = 0usize;
+    for (id, parts) in masks {
+        let mut img = vec![0u8; cw * ch];
+        let (mut n, mut x0, mut y0, mut x1, mut y1) = (0u64, usize::MAX, usize::MAX, 0usize, 0usize);
+        for (bx, bz, mask) in parts {
+            for r in 0..th {
+                let y = (bz - min_bz) as usize * th + r;
+                for c in 0..tw {
+                    let i = r * tw + c;
+                    if mask.get(i / 8).map_or(false, |v| (v >> (i % 8)) & 1 == 1) {
+                        let x = (bx - min_bx) as usize * tw + c;
+                        img[y * cw + x] = 255;
+                        n += 1;
+                        x0 = x0.min(x); x1 = x1.max(x); y0 = y0.min(y); y1 = y1.max(y);
+                    }
+                }
+            }
+        }
+        if n == 0 { continue; }
+        let png = dir.join(format!("id_{}.png", id));
+        image::GrayImage::from_raw(cw as u32, ch as u32, img)
+            .ok_or("split buffer size mismatch")?
+            .save(&png)
+            .map_err(|e| format!("failed to save '{}': {}", png.display(), e))?;
+        let c = id_colour(*id);
+        let name = names.get(id).map(String::as_str).unwrap_or("");
+        writeln!(f, "{},{},{},{},{},{},{},{},{},{},{}", id, c[0], c[1], c[2], n, x0, y0, x1, y1, parts.len(), crate::worldlut::csv_field(name)).map_err(io)?;
+        written += 1;
+    }
+    f.flush().map_err(io)?;
+    println!("  kind {}: {} per-id mask image(s) -> {}", kind, written, dir.display());
+    Ok(())
+}
+
 /// Write `k<kind>_ids.png` (pixel colour = layer id) and `k<kind>_legend.csv` (layer_id, colour, pixels, name)
-/// for every kind of `world` into `out_dir`. `lang` is en.lang.csv; it names the kind-2 (zone map) ids.
-pub fn run(table: &Path, lang: Option<&Path>, world: u32, out_dir: &Path, only: &[(u32, u32)], split: Option<&[u32]>) -> Result<(), String> {
-    println!("Parsing file: {}", table.display());
-    let data = std::fs::read(table).map_err(|e| format!("failed to read '{}': {}", table.display(), e))?;
-    let blocks = scan(&data, world)?;
+/// for every kind of `world` into `out_dir`. `lang` is en.lang; it names the kind-2 (zone map) ids.
+pub fn run(data: &[u8], lang: Option<&crate::archive::LangTable>, world: u32, out_dir: &Path, split: &Split) -> Result<(), String> {
+    let blocks = scan(data, world)?;
     if blocks.is_empty() {
         return Err(format!("no terrain layer entries for world 0x{:x} ({}).", world, world));
     }
 
-    // single-value mode: skip the full ids/legend export (and the lang file) and write one mask image per (kind, id)
-    if !only.is_empty() {
-        return run_only(&data, &blocks, out_dir, only);
-    }
-
     let zone_names: HashMap<u32, String> = match lang {
-        Some(p) => {
-            let n = crate::worldlut::load_lang_group(p, ZONE_MAP_NAME_GROUP)
-                .map_err(|e| format!("failed to read '{}': {}", p.display(), e))?;
-            println!("Loaded {} zone names from {}", n.len(), p.display());
+        Some(l) => {
+            let n = l.group(ZONE_MAP_NAME_GROUP).clone();
+            println!("Loaded {} zone names from en.lang", n.len());
             n
         }
         None => {
-            eprintln!("Warning: en.lang.csv not found; zone names will be empty.");
+            eprintln!("Warning: en.lang not available; zone names will be empty.");
             HashMap::new()
         }
     };
-
-    // split mode: one file per layer id (kind-2 ids are named from the lang file)
-    if let Some(kinds) = split {
-        return run_split(&data, &blocks, out_dir, kinds, &zone_names);
-    }
 
     // one canvas origin for every kind, so all the images line up
     let min_bx = blocks.iter().map(|b| b.bx).min().unwrap();
@@ -214,6 +265,7 @@ pub fn run(table: &Path, lang: Option<&Path>, world: u32, out_dir: &Path, only: 
         let ch = (max_bz - min_bz + 1) as usize * th;
         let mut rgb = vec![0u8; cw * ch * 3];
         let mut counts: BTreeMap<u32, u64> = BTreeMap::new();
+        let mut split_masks: IdMasks = BTreeMap::new();
 
         for b in &bs {
             for l in &b.layers {
@@ -232,6 +284,9 @@ pub fn run(table: &Path, lang: Option<&Path>, world: u32, out_dir: &Path, only: 
                     }
                 }
                 *counts.entry(l.id).or_insert(0) += n;
+                if split.wants(kind, l.id) {
+                    split_masks.entry(l.id).or_default().push((b.bx, b.bz, mask));
+                }
             }
         }
 
@@ -260,165 +315,22 @@ pub fn run(table: &Path, lang: Option<&Path>, world: u32, out_dir: &Path, only: 
         }
         f.flush().map_err(io)?;
 
+
+        if !split_masks.is_empty() {
+            let empty = HashMap::new();
+            let names = if kind == ZONE_MAP_KIND { &zone_names } else { &empty };
+            write_split(kind, &split_masks, (tw, th), (cw, ch), (min_bx, min_bz), names, out_dir)?;
+        }
+        for (k, id) in &split.only {
+            if *k == kind && !split_masks.contains_key(id) {
+                eprintln!("  kind {}: layer id {} not present in this world.", kind, id);
+            }
+        }
         print!("kind {}: {}x{} px, {} layer id(s) -> {}", kind, cw, ch, counts.len(), png.display());
         if kind == ZONE_MAP_KIND {
             print!(" ({} without a name)", unnamed);
         }
         println!();
-    }
-    Ok(())
-}
-
-/// Single-value mode: for every requested (kind, layer id) write `k<kind>_id<id>.png`, a white-on-black mask of the cells
-/// where that layer id is set. The canvas origin/size is the same as the full `k<kind>_ids.png` images (it spans every
-/// block of the world), so the masks line up with them. Unlike the full image, nothing is drawn over the mask by later
-/// layers, so it is the raw layer data.
-fn run_only(data: &[u8], blocks: &[Block], out_dir: &Path, only: &[(u32, u32)]) -> Result<(), String> {
-    let min_bx = blocks.iter().map(|b| b.bx).min().unwrap();
-    let max_bx = blocks.iter().map(|b| b.bx).max().unwrap();
-    let min_bz = blocks.iter().map(|b| b.bz).min().unwrap();
-    let max_bz = blocks.iter().map(|b| b.bz).max().unwrap();
-    std::fs::create_dir_all(out_dir).map_err(|e| format!("failed to create '{}': {}", out_dir.display(), e))?;
-
-    let mut wanted: Vec<(u32, u32)> = only.to_vec();
-    wanted.sort_unstable();
-    wanted.dedup();
-
-    for (kind, id) in wanted {
-        let bs: Vec<&Block> = blocks.iter().filter(|b| b.kind == kind).collect();
-        if bs.is_empty() {
-            eprintln!("  kind {}: no entries in this world, skipped.", kind);
-            continue;
-        }
-        let (tw, th) = (bs[0].w, bs[0].h);
-        if tw == 0 || th == 0 || bs.iter().any(|b| b.w != tw || b.h != th) {
-            eprintln!("  kind {}: tile sizes differ, skipped.", kind);
-            continue;
-        }
-        let cw = (max_bx - min_bx + 1) as usize * tw;
-        let ch = (max_bz - min_bz + 1) as usize * th;
-        let mut px = vec![0u8; cw * ch];
-        let (mut cells, mut tiles) = (0u64, 0usize);
-
-        for b in &bs {
-            let mut hit = false;
-            for l in b.layers.iter().filter(|l| l.id == id) {
-                let mask = decode_mask(data, l)?;
-                for r in 0..th {
-                    let y = (b.bz - min_bz) as usize * th + r;
-                    for c in 0..tw {
-                        let i = r * tw + c;
-                        if mask.get(i / 8).map_or(false, |v| (v >> (i % 8)) & 1 == 1) {
-                            px[y * cw + (b.bx - min_bx) as usize * tw + c] = 255;
-                            cells += 1;
-                            hit = true;
-                        }
-                    }
-                }
-            }
-            if hit {
-                tiles += 1;
-            }
-        }
-
-        if cells == 0 {
-            eprintln!("  kind {} id {}: not present in this world (nothing written).", kind, id);
-            continue;
-        }
-        let png = out_dir.join(format!("k{}_id{}.png", kind, id));
-        image::GrayImage::from_raw(cw as u32, ch as u32, px)
-            .ok_or("stitched buffer size mismatch")?
-            .save(&png)
-            .map_err(|e| format!("failed to save '{}': {}", png.display(), e))?;
-        println!("kind {} id {}: {} cell(s) in {} block(s), {}x{} px -> {}", kind, id, cells, tiles, cw, ch, png.display());
-    }
-    Ok(())
-}
-
-/// Split mode: for every layer id of the requested kinds (all kinds when `kinds` is empty) write
-/// `k<kind>_layers/id_<id>.png` (white = set, black = not; same canvas as the full `k<kind>_ids.png`) and an
-/// `index.csv` (layer_id,r,g,b,pixels,blocks,x0,y0,x1,y1,name) beside them. Every layer is drawn on its own, so
-/// overlapping ids no longer hide each other as they do in the stitched image.
-fn run_split(data: &[u8], blocks: &[Block], out_dir: &Path, kinds: &[u32], zone_names: &HashMap<u32, String>) -> Result<(), String> {
-    let min_bx = blocks.iter().map(|b| b.bx).min().unwrap();
-    let max_bx = blocks.iter().map(|b| b.bx).max().unwrap();
-    let min_bz = blocks.iter().map(|b| b.bz).min().unwrap();
-    let max_bz = blocks.iter().map(|b| b.bz).max().unwrap();
-
-    let mut by_kind: BTreeMap<u32, Vec<&Block>> = BTreeMap::new();
-    for b in blocks {
-        if kinds.is_empty() || kinds.contains(&b.kind) {
-            by_kind.entry(b.kind).or_default().push(b);
-        }
-    }
-    if by_kind.is_empty() {
-        return Err("none of the requested kinds exist in this world.".to_string());
-    }
-
-    for (kind, bs) in by_kind {
-        let (tw, th) = (bs[0].w, bs[0].h);
-        if tw == 0 || th == 0 || bs.iter().any(|b| b.w != tw || b.h != th) {
-            eprintln!("  kind {}: tile sizes differ, skipped.", kind);
-            continue;
-        }
-        let cw = (max_bx - min_bx + 1) as usize * tw;
-        let ch = (max_bz - min_bz + 1) as usize * th;
-
-        // layer id -> every (block, layer) that carries it, so each layer is inflated exactly once
-        let mut by_id: BTreeMap<u32, Vec<(&Block, &Layer)>> = BTreeMap::new();
-        for b in &bs {
-            for l in &b.layers {
-                by_id.entry(l.id).or_default().push((b, l));
-            }
-        }
-
-        let dir = out_dir.join(format!("k{}_layers", kind));
-        std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create '{}': {}", dir.display(), e))?;
-        let csv = dir.join("index.csv");
-        let mut f = BufWriter::new(File::create(&csv).map_err(|e| format!("failed to create '{}': {}", csv.display(), e))?);
-        let io = |e: std::io::Error| format!("failed to write '{}': {}", csv.display(), e);
-        writeln!(f, "layer_id,r,g,b,pixels,blocks,x0,y0,x1,y1,name").map_err(io)?;
-
-        let mut px = vec![0u8; cw * ch];
-        let mut written = 0usize;
-        for (id, parts) in &by_id {
-            px.iter_mut().for_each(|p| *p = 0);
-            let (mut cells, mut tiles) = (0u64, 0usize);
-            let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0usize, 0usize);
-            for (b, l) in parts {
-                let mask = decode_mask(data, l)?;
-                let mut hit = false;
-                for r in 0..th {
-                    let y = (b.bz - min_bz) as usize * th + r;
-                    for c in 0..tw {
-                        let i = r * tw + c;
-                        if mask.get(i / 8).map_or(false, |v| (v >> (i % 8)) & 1 == 1) {
-                            let x = (b.bx - min_bx) as usize * tw + c;
-                            px[y * cw + x] = 255;
-                            cells += 1;
-                            hit = true;
-                            x0 = x0.min(x); y0 = y0.min(y); x1 = x1.max(x); y1 = y1.max(y);
-                        }
-                    }
-                }
-                if hit { tiles += 1; }
-            }
-            let col = id_colour(*id);
-            let name = if kind == ZONE_MAP_KIND { zone_names.get(id).map(|s| s.as_str()).unwrap_or("") } else { "" };
-            if cells == 0 {
-                writeln!(f, "{},{},{},{},0,0,,,,,{}", id, col[0], col[1], col[2], crate::worldlut::csv_field(name)).map_err(io)?;
-                continue;
-            }
-            let png = dir.join(format!("id_{}.png", id));
-            image::GrayImage::from_raw(cw as u32, ch as u32, px.clone())
-                .ok_or("stitched buffer size mismatch")?
-                .save(&png)
-                .map_err(|e| format!("failed to save '{}': {}", png.display(), e))?;
-            writeln!(f, "{},{},{},{},{},{},{},{},{},{},{}", id, col[0], col[1], col[2], cells, tiles, x0, y0, x1, y1, crate::worldlut::csv_field(name)).map_err(io)?;
-            written += 1;
-        }
-        f.flush().map_err(io)?;
-        println!("kind {}: {}x{} px, {} layer id(s) -> {} file(s) in {}", kind, cw, ch, by_id.len(), written, dir.display());
     }
     Ok(())
 }
