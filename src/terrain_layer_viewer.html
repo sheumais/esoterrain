@@ -283,7 +283,7 @@
                             const S = set.split.get(c.kind);
                             if (c.id === null) {
                                 const rows = parseCSV(await f.text());
-                                rows.slice(1).filter(r => r.length >= 5 && r[0] !== '').forEach(r => S.index.set(parseInt(r[0], 10), { r: +r[1], g: +r[2], b: +r[3], pixels: +r[4], name: r[10] || '' }));
+                                rows.slice(1).filter(r => r.length >= 5 && r[0] !== '').forEach(r => S.index.set(parseInt(r[0], 10), { r: +r[1], g: +r[2], b: +r[3], pixels: +r[4], name: r[10] || '', h: (r[11] || '').trim() === '' ? null : +r[11] }));
                             } else {
                                 const L = await loadSplitLayer(S, c.id, f);
                                 if (L) S.layers.set(c.id, L);
@@ -298,7 +298,8 @@
                         else {
                             const rows = parseCSV(await f.text());
                             K.pendingLegend = rows.slice(1).filter(r => r.length >= 5 && r[0] !== '').map(r => ({
-                                id: parseInt(r[0], 10), r: +r[1], g: +r[2], b: +r[3], pixels: +r[4], name: r[5] || ''
+                                id: parseInt(r[0], 10), r: +r[1], g: +r[2], b: +r[3], pixels: +r[4], name: r[5] || '',
+                                lava: (r[6] || '').trim().toLowerCase() === 'true', h: (r[7] || '').trim() === '' ? null : +r[7]
                             }));
                         }
                         touched.add(K); ok++;
@@ -346,12 +347,12 @@
                 let n = 0;
                 for (let y = 0; y < bh; y++) for (let x = 0; x < bw; x++) if (px[(y + y0) * w + x + x0] & 0xFF) { mask[y * bw + x] = 1; n++; }
                 const [r, g, b] = idColour(id);
-                return { id, r, g, b, pixels: n, name: '', x0, y0, bw, bh, mask, canvas: null, visible: false };
+                return { id, r, g, b, pixels: n, name: '', h: null, x0, y0, bw, bh, mask, canvas: null, visible: false };
             }
             function applySplitIndex(S) {
                 for (const L of S.layers.values()) {
                     const e = S.index.get(L.id);
-                    if (e) { L.r = e.r; L.g = e.g; L.b = e.b; L.name = e.name; }
+                    if (e) { L.r = e.r; L.g = e.g; L.b = e.b; L.name = e.name; L.h = e.h; }
                     L.canvas = null;
                 }
             }
@@ -482,7 +483,7 @@
                     const row = document.createElement('div');
                     row.className = 'legRow' + (K.sel.has(i) ? ' sel' : '');
                     const sw = document.createElement('span'); sw.className = 'sw'; sw.style.background = `rgb(${e.r},${e.g},${e.b})`;
-                    const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = label || ('id ' + e.id); nm.title = label || ('id ' + e.id);
+                    const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = label || ('id ' + e.id); nm.title = (label || ('id ' + e.id)) + (e.h != null ? ' · water y ' + e.h : '') + (e.lava ? ' · lava' : '');
                     const id = document.createElement('span'); id.className = 'id'; id.textContent = e.id === null ? '' : e.id;
                     const pc = document.createElement('span'); pc.className = 'pc'; pc.textContent = (100 * e.vis / total).toFixed(1) + '%';
                     row.append(sw, nm, id, pc);
@@ -510,7 +511,7 @@
                     const cb = document.createElement('input'); cb.type = 'checkbox'; cb.checked = L.visible;
                     cb.onchange = () => { L.visible = cb.checked; draw(); };
                     const sw = document.createElement('span'); sw.className = 'sw'; sw.style.background = `rgb(${L.r},${L.g},${L.b})`;
-                    const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = L.name || ('id ' + L.id); nm.title = nm.textContent;
+                    const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = L.name || ('id ' + L.id); nm.title = nm.textContent + (L.h != null ? ' · water y ' + L.h : '');
                     const id = document.createElement('span'); id.className = 'id'; id.textContent = L.name ? L.id : '';
                     const pc = document.createElement('span'); pc.className = 'pc'; pc.textContent = L.pixels; pc.title = L.pixels + ' cells';
                     row.append(cb, sw, nm, id, pc);
@@ -678,7 +679,7 @@
                     if (i < 0) { html += `<div class="ln"><span class="k">${kindLabel(K.kind)}:</span> no data</div>`; continue; }
                     const e = K.legend[i];
                     any = true;
-                    html += `<div class="ln"><span class="sw" style="background:rgb(${e.r},${e.g},${e.b})"></span><span class="k">${kindLabel(K.kind)}:</span> <b>${esc(e.name || (e.id === null ? 'unknown colour' : 'id ' + e.id))}</b>${e.id !== null && e.name ? ' <span class="k">(' + e.id + ')</span>' : ''}</div>`;
+                    html += `<div class="ln"><span class="sw" style="background:rgb(${e.r},${e.g},${e.b})"></span><span class="k">${kindLabel(K.kind)}:</span> <b>${esc(e.name || (e.id === null ? 'unknown colour' : 'id ' + e.id))}</b>${e.id !== null && e.name ? ' <span class="k">(' + e.id + ')</span>' : ''}${waterTag(e)}</div>`;
                 }
                 const SP = curSplit();
                 if (SP) {
@@ -690,7 +691,7 @@
                         if (lx < 0 || ly < 0 || lx >= L.bw || ly >= L.bh || !L.mask[ly * L.bw + lx]) continue;
                         any = true;
                         if (++n > 12) { extra++; continue; }
-                        html += `<div class="ln"><span class="sw" style="background:rgb(${L.r},${L.g},${L.b})"></span><span class="k">${kindLabel(SP.kind)} split:</span> <b>${esc(L.name || ('id ' + L.id))}</b>${L.name ? ' <span class="k">(' + L.id + ')</span>' : ''}</div>`;
+                        html += `<div class="ln"><span class="sw" style="background:rgb(${L.r},${L.g},${L.b})"></span><span class="k">${kindLabel(SP.kind)} split:</span> <b>${esc(L.name || ('id ' + L.id))}</b>${L.name ? ' <span class="k">(' + L.id + ')</span>' : ''}${waterTag(L)}</div>`;
                     }
                     if (extra) html += `<div class="ln"><span class="k">+${extra} more</span></div>`;
                 }
@@ -701,6 +702,7 @@
                 tip.style.left = Math.min(sx + 16, vw - tw - 6) + 'px';
                 tip.style.top = Math.min(sy + 16, vh - th - 6) + 'px';
             }
+            const waterTag = e => (e.h != null ? ' <span class="k">· water y</span> ' + e.h : '') + (e.lava ? ' <b>· lava</b>' : '');
             const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
 
             function clickAt(sx, sy) {

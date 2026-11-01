@@ -39,7 +39,7 @@ const ZONE_MAP_NAME_GROUP: &str = "162946485";
 const MAGIC: [u8; 4] = [0xFA, 0xFA, 0xEB, 0xEB];
 const FILE_HEADER_LEN: usize = 16;
 const ENTRY_PREFIX_LEN: usize = 32; // separator (16) + sub-header (16)
-const PAYLOAD_MIN: usize = 53; // everything up to the layer list
+const PAYLOAD_MIN: usize = 50;
 
 struct Layer {
     id: u32,
@@ -84,8 +84,9 @@ fn scan(d: &[u8], world: u32) -> Result<Vec<Block>, String> {
         let key = be32(d, p);
         if key >> 17 == world {
             let mut layers = Vec::new();
-            let mut q = p + PAYLOAD_MIN;
-            for _ in 0..be32(d, p + 49) {
+            let nlayers = d[p + 49] as usize;   // was: be32(d, p + 49)
+            let mut q = p + PAYLOAD_MIN;        // now p + 50
+            for _ in 0..nlayers {
                 if q + 12 > end {
                     return Err(format!("entry {}: layer header runs past the entry.", n + 1));
                 }
@@ -158,6 +159,22 @@ fn id_colour(id: u32) -> [u8; 3] {
     [(h & 0xFF) as u8 | 0x40, ((h >> 8) & 0xFF) as u8 | 0x40, ((h >> 16) & 0xFF) as u8 | 0x40]
 }
 
+/// What the surface table (0x45) says about one terrain layer id. That table is keyed by the kind-6 layer ids only
+/// (every kind numbers its ids separately), so it is only looked up for `SURFACE_KIND`.
+#[derive(Clone, Copy, Default)]
+pub struct Surface {
+    pub lava: bool,
+    /// Water surface height in game units (u32 at payload +25, e.g. 10020 for the Cyrodiil water).
+    pub water_height: u32,
+}
+pub type SurfaceMap = HashMap<u32, Surface>;
+pub const SURFACE_KIND: u32 = 6;
+
+fn height_field(kind: u32, id: u32, surface: &SurfaceMap) -> String {
+    if kind != SURFACE_KIND { return String::new(); }
+    surface.get(&id).map(|s| s.water_height.to_string()).unwrap_or_default()
+}
+
 /// Which layer ids also get their own full-size mask image (`k<kind>_layers/id_<id>.png`).
 #[derive(Default, Clone)]
 pub struct Split {
@@ -180,14 +197,14 @@ impl Split {
 type IdMasks = BTreeMap<u32, Vec<(u32, u32, Vec<u8>)>>; // id -> (bx, bz, 1-bit mask)
 
 fn write_split(kind: u32, masks: &IdMasks, (tw, th): (usize, usize), (cw, ch): (usize, usize), (min_bx, min_bz): (u32, u32),
-               names: &HashMap<u32, String>, out_dir: &Path) -> Result<(), String> {
+               names: &HashMap<u32, String>, surface: &SurfaceMap, out_dir: &Path) -> Result<(), String> {
     let dir = out_dir.join(format!("k{}_layers", kind));
     std::fs::create_dir_all(&dir).map_err(|e| format!("failed to create '{}': {}", dir.display(), e))?;
     let csv = dir.join("index.csv");
     let mut f = BufWriter::new(File::create(&csv).map_err(|e| format!("failed to create '{}': {}", csv.display(), e))?);
     let io = |e: std::io::Error| format!("failed to write '{}': {}", csv.display(), e);
-    // The viewer reads columns 0-4 and the name from column 10.
-    writeln!(f, "layer_id,r,g,b,pixels,x0,y0,x1,y1,blocks,name").map_err(io)?;
+    // The viewer reads columns 0-4, the name from column 10 and water_height from column 11.
+    writeln!(f, "layer_id,r,g,b,pixels,x0,y0,x1,y1,blocks,name,water_height").map_err(io)?;
     let mut written = 0usize;
     for (id, parts) in masks {
         let mut img = vec![0u8; cw * ch];
@@ -214,7 +231,7 @@ fn write_split(kind: u32, masks: &IdMasks, (tw, th): (usize, usize), (cw, ch): (
             .map_err(|e| format!("failed to save '{}': {}", png.display(), e))?;
         let c = id_colour(*id);
         let name = names.get(id).map(String::as_str).unwrap_or("");
-        writeln!(f, "{},{},{},{},{},{},{},{},{},{},{}", id, c[0], c[1], c[2], n, x0, y0, x1, y1, parts.len(), crate::worldlut::csv_field(name)).map_err(io)?;
+        writeln!(f, "{},{},{},{},{},{},{},{},{},{},{},{}", id, c[0], c[1], c[2], n, x0, y0, x1, y1, parts.len(), crate::worldlut::csv_field(name), height_field(kind, *id, surface)).map_err(io)?;
         written += 1;
     }
     f.flush().map_err(io)?;
@@ -224,7 +241,7 @@ fn write_split(kind: u32, masks: &IdMasks, (tw, th): (usize, usize), (cw, ch): (
 
 /// Write `k<kind>_ids.png` (pixel colour = layer id) and `k<kind>_legend.csv` (layer_id, colour, pixels, name)
 /// for every kind of `world` into `out_dir`. `lang` is en.lang; it names the kind-2 (zone map) ids.
-pub fn run(data: &[u8], lang: Option<&crate::archive::LangTable>, world: u32, out_dir: &Path, split: &Split) -> Result<(), String> {
+pub fn run(data: &[u8], lang: Option<&crate::archive::LangTable>, world: u32, out_dir: &Path, split: &Split, surface: &SurfaceMap) -> Result<(), String> {
     let blocks = scan(data, world)?;
     if blocks.is_empty() {
         return Err(format!("no terrain layer entries for world 0x{:x} ({}).", world, world));
@@ -299,7 +316,7 @@ pub fn run(data: &[u8], lang: Option<&crate::archive::LangTable>, world: u32, ou
         let csv = out_dir.join(format!("k{}_legend.csv", kind));
         let mut f = BufWriter::new(File::create(&csv).map_err(|e| format!("failed to create '{}': {}", csv.display(), e))?);
         let io = |e: std::io::Error| format!("failed to write '{}': {}", csv.display(), e);
-        writeln!(f, "layer_id,r,g,b,pixels,name").map_err(io)?;
+        writeln!(f, "layer_id,r,g,b,pixels,name,lava,water_height").map_err(io)?;
         let mut unnamed = 0usize;
         for (id, n) in &counts {
             let c = id_colour(*id);
@@ -311,7 +328,8 @@ pub fn run(data: &[u8], lang: Option<&crate::archive::LangTable>, world: u32, ou
             } else {
                 ""
             };
-            writeln!(f, "{},{},{},{},{},{}", id, c[0], c[1], c[2], n, crate::worldlut::csv_field(name)).map_err(io)?;
+            let lava = kind == SURFACE_KIND && surface.get(id).map_or(false, |s| s.lava);
+            writeln!(f, "{},{},{},{},{},{},{},{}", id, c[0], c[1], c[2], n, crate::worldlut::csv_field(name), lava, height_field(kind, *id, surface)).map_err(io)?;
         }
         f.flush().map_err(io)?;
 
@@ -319,7 +337,7 @@ pub fn run(data: &[u8], lang: Option<&crate::archive::LangTable>, world: u32, ou
         if !split_masks.is_empty() {
             let empty = HashMap::new();
             let names = if kind == ZONE_MAP_KIND { &zone_names } else { &empty };
-            write_split(kind, &split_masks, (tw, th), (cw, ch), (min_bx, min_bz), names, out_dir)?;
+            write_split(kind, &split_masks, (tw, th), (cw, ch), (min_bx, min_bz), names, surface, out_dir)?;
         }
         for (k, id) in &split.only {
             if *k == kind && !split_masks.contains_key(id) {
@@ -333,4 +351,103 @@ pub fn run(data: &[u8], lang: Option<&crate::archive::LangTable>, world: u32, ou
         println!();
     }
     Ok(())
+}
+
+// ---- water / lava bodies for the Blender scene ------------------------------------------------------------------
+
+/// Size of a terrain-layer block in placement units (the key's bx/bz are 500-unit blocks; a block is 2x2 placement cells).
+const BLOCK_UNITS: f64 = 500.0;
+
+/// One water or lava body of a world: a kind-6 layer id, its surface height and where it lies, as rectangles.
+pub struct WaterBody {
+    pub id: u32,
+    /// Surface height in placement units (game y): the surface table's u32 divided by 100 (10020 -> 100.2).
+    pub height: f64,
+    pub lava: bool,
+    /// Placement units per mask cell (500 / grid width = 5).
+    pub cell: f64,
+    /// Rectangles `[x0, z0, x1, z1]` in mask cells counted from the world origin (block 0), end exclusive:
+    /// placement x = cell * x, placement z = cell * z.
+    pub rects: Vec<[i64; 4]>,
+}
+
+/// Merge the set cells (non-zero) of a `w` x `h` row-major grid into rectangles `[x0, y0, x1, y1]` (end exclusive).
+/// Every row is cut into runs; a run directly below a rectangle with exactly the same x range extends it.
+pub fn greedy_rects(grid: &[u8], w: usize, h: usize) -> Vec<[usize; 4]> {
+    let mut out: Vec<[usize; 4]> = Vec::new();
+    let mut open: HashMap<(usize, usize), usize> = HashMap::new();
+    for y in 0..h {
+        let row = &grid[y * w..(y + 1) * w];
+        let mut next: HashMap<(usize, usize), usize> = HashMap::new();
+        let mut x = 0;
+        while x < w {
+            if row[x] == 0 { x += 1; continue; }
+            let a = x;
+            while x < w && row[x] != 0 { x += 1; }
+            let i = match open.get(&(a, x)) {
+                Some(&i) => { out[i][3] = y + 1; i }
+                None => { out.push([a, y, x, y + 1]); out.len() - 1 }
+            };
+            next.insert((a, x), i);
+        }
+        open = next;
+    }
+    out
+}
+
+/// Every liquid layer (kind 6) of `world` that the surface table (0x45) knows, as rectangles at its water height.
+/// Layer ids missing from the surface table (and id 0) are skipped. The masks of one id are merged across blocks
+/// first, so a lake that crosses block borders comes out as one body without seams.
+pub fn water_bodies(data: &[u8], world: u32, surface: &SurfaceMap) -> Result<Vec<WaterBody>, String> {
+    let blocks = scan(data, world)?;
+    let bs: Vec<&Block> = blocks.iter().filter(|b| b.kind == SURFACE_KIND).collect();
+    if bs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let (tw, th) = (bs[0].w, bs[0].h);
+    if tw == 0 || th == 0 || bs.iter().any(|b| b.w != tw || b.h != th) {
+        return Err(format!("kind {}: tile sizes differ.", SURFACE_KIND));
+    }
+    let min_bx = bs.iter().map(|b| b.bx).min().unwrap();
+    let max_bx = bs.iter().map(|b| b.bx).max().unwrap();
+    let min_bz = bs.iter().map(|b| b.bz).min().unwrap();
+    let max_bz = bs.iter().map(|b| b.bz).max().unwrap();
+    let cw = (max_bx - min_bx + 1) as usize * tw;
+    let ch = (max_bz - min_bz + 1) as usize * th;
+    let (ox, oz) = (min_bx as i64 * tw as i64, min_bz as i64 * th as i64);
+
+    let mut by_id: BTreeMap<u32, Vec<(&Block, &Layer)>> = BTreeMap::new();
+    for b in &bs {
+        for l in &b.layers {
+            if l.id != 0 && surface.contains_key(&l.id) {
+                by_id.entry(l.id).or_default().push((b, l));
+            }
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut px = vec![0u8; cw * ch];
+    for (id, parts) in &by_id {
+        px.iter_mut().for_each(|p| *p = 0);
+        for (b, l) in parts {
+            let mask = decode_mask(data, l)?;
+            for r in 0..th {
+                let y = (b.bz - min_bz) as usize * th + r;
+                for c in 0..tw {
+                    let i = r * tw + c;
+                    if mask.get(i / 8).map_or(false, |v| (v >> (i % 8)) & 1 == 1) {
+                        px[y * cw + (b.bx - min_bx) as usize * tw + c] = 1;
+                    }
+                }
+            }
+        }
+        let rects: Vec<[i64; 4]> = greedy_rects(&px, cw, ch)
+            .into_iter()
+            .map(|r| [r[0] as i64 + ox, r[1] as i64 + oz, r[2] as i64 + ox, r[3] as i64 + oz])
+            .collect();
+        if rects.is_empty() { continue; }
+        let s = surface[id];
+        out.push(WaterBody { id: *id, height: s.water_height as f64 / 100.0, lava: s.lava, cell: BLOCK_UNITS / tw as f64, rects });
+    }
+    Ok(out)
 }

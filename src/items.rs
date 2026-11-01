@@ -10,7 +10,7 @@ pub const ITEM_NAME_TABLE_DEF: u32 = 0x171;
 pub const ITEM_NAME_GROUP: &str = "18173141";
 
 const NAME_TEMPLATE_OFFSET: usize = 57;
-const NAME_ID_OFFSET: usize = 69;
+const NAME_ID_OFFSET: usize = 66;
 
 const FF: u32 = 0xFFFF_FFFF;
 const TEX_OFFSET: usize = 57;
@@ -39,8 +39,8 @@ fn parts(e: &[u8]) -> Vec<Part> {
                 return None;
             }
             let (m, m2, k1, k2) = (be32(e, i)?, be32(e, i + 4)?, be32(e, i + 8)?, be32(e, i + 12)?);
-            (m != 0 && m < BOGUS_ID && m2 < BOGUS_ID && k1 != 0 && k1 == k2)
-                .then_some(Part { model: m, model2: m2, mat_key: k1 })
+            (m != 0 && m < BOGUS_ID && m2 < BOGUS_ID)
+                .then_some(Part { model: m, model2: m2, mat_key: if k1 != 0 { k1 } else { k2 } })
         })();
         match hit {
             Some(p) => {
@@ -236,4 +236,4 @@ pub fn find_in_lut(path: &Path, id: u32) -> io::Result<Vec<LutRow>> {
         });
     }
     Ok(rows)
-}
+}

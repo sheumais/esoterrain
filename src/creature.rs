@@ -6,7 +6,6 @@ pub const CREATURE_NAME_GROUP: &str = "8290981";
 
 const HEADER_LEN: usize = 16;
 const ONE_F32: [u8; 4] = [0x00, 0x00, 0x80, 0x3F];
-const MODEL_SCAN: std::ops::Range<usize> = 60..400;
 const TEX_OFFSET: usize = 57;
 
 const CREATURE_LINK_OFFSET: usize = 0x98;
@@ -19,18 +18,22 @@ pub fn be24(b: &[u8], o: usize) -> Option<u32> {
     b.get(o..o + 3).map(|s| u32::from_be_bytes([0, s[0], s[1], s[2]]))
 }
 
+const MODEL_SCAN_START: usize = 60;
+const SKEL_SCAN: usize = 120;
+const SKEL_FROM_ONE: usize = 13;
+
 fn model_record(e: &[u8]) -> Option<(u32, u32, u32)> {
-    for i in MODEL_SCAN {
-        let c = *e.get(i.checked_sub(1)?)? as usize;
-        if !(1..=32).contains(&c) || e.get(i + 4..i + 8)? != ONE_F32 {
-            continue;
-        }
-        if c > 1 && e.get(i + 20..i + 24) != Some(&ONE_F32[..]) {
-            continue;
-        }
+    for i in MODEL_SCAN_START..e.len().saturating_sub(40) {
+        let c = e[i - 1] as usize;
+        if !(1..=32).contains(&c) || e[i + 4..i + 8] != ONE_F32 { continue; }
+        if c > 1 && e.get(i + 20..i + 24) != Some(&ONE_F32[..]) { continue; }
         let end = i + 16 * c;
-        let len = *e.get(end + 9)? as usize; // optional string (e.g. "BretonMale")
-        return Some((be32(e, i + 8)?, be32(e, i + 12)?, be32(e, end + 55 + len)?));
+        let (model, tex) = (be32(e, i + 8)?, be32(e, i + 12)?);
+        // skeleton: the 1.0f closing the float triple after the array, followed by a small u32
+        let skel = (end + 8..(end + SKEL_SCAN).min(e.len().saturating_sub(20)))
+            .find(|&p| e[p..p + 4] == ONE_F32 && be32(e, p + 4).map_or(false, |v| v <= 16))
+            .and_then(|p| be32(e, p + SKEL_FROM_ONE))?;
+        return Some((model, tex, skel));
     }
     None
 }
@@ -41,8 +44,14 @@ pub struct Appearance {
     pub tex: [u32; 3],
 }
 
+fn creature_link_row(c: &[u8]) -> Option<u32> {
+    let a = (0x80..c.len().saturating_sub(4)).find(|&i| c[i..i + 4] == ONE_F32)?;
+    let row = u16::from_be_bytes([*c.get(a.checked_sub(4)?)?, *c.get(a - 3)?]) as u32;
+    (row > 1).then_some(row)
+}
+
 fn resolve(c: &[u8], links: &Table, models: &Table, textures: &Table) -> Option<Appearance> {
-    let link = links.get_by_row(be24(c, CREATURE_LINK_OFFSET)?)?;
+    let link = links.get_by_row(creature_link_row(c)?)?;
     let model = models.get_by_row(be32(link, LINK_MODEL_ROW_OFFSET)?)?;
     let (m, tex_row, sk) = model_record(model)?;
     if matches!(m,  0 | DEFAULT_MODEL) {
@@ -180,4 +189,4 @@ pub fn find_in_lut(path: &Path, id: u32) -> io::Result<Vec<LutRow>> {
         return Ok(by_table);
     }
     Ok(rows.into_iter().filter(|r| r.name_id == id).collect())
-}
+}

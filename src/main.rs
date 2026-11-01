@@ -18,6 +18,8 @@ mod world_models;
 mod terrain_textures;
 mod model_summary;
 mod terrain_layers;
+mod find_ids;
+mod mnf_diff;
 
 use landfile::{fixed_channel_range, save_rgb_from_channels, LandFile, RawBigImage, RawTile};
 use archive::Archive;
@@ -34,7 +36,8 @@ const FINAL_EXPORT_DIR: &str = out::EXPORT_DIR;
 const LUT_DIR: &str = out::LUT_DIR; // all *_lut.csv files; per-world model LUTs go in LUT_DIR/worlds/
 /// Folder (or file) holding `oo2core_8_win64.dll`; needed to read Oodle-compressed entries.
 const DEFAULT_OODLE: &str = "./tool";
-const RAW_MNF: &str = "C:/Program Files (x86)/Steam/steamapps/common/Zenimax Online/The Elder Scrolls Online/depot/eso.mnf";
+//const RAW_MNF: &str = "C:/Program Files (x86)/Steam/steamapps/common/Zenimax Online/The Elder Scrolls Online/depot/eso.mnf";
+const RAW_MNF: &str = "D:/Steam/steamapps/common/Zenimax Online/The Elder Scrolls Online PTS/depot/eso.mnf";
 const NOESIS: &str = "./tool/Noesis64.exe";
 const MAX_SANE_GRID_SPAN: u32 = 128;
 
@@ -65,6 +68,8 @@ struct Args {
     scene_name: Option<String>,
     scene_script_only: bool,
     scene_grid: bool,
+    scene_water: bool,
+    scene_world: Option<u32>,
     keeps: bool,
     keep_key: Option<u32>,
     keep_list: bool,
@@ -79,6 +84,9 @@ struct Args {
     terrain_layers: Option<u32>,
     tl_split: Option<Vec<u32>>,
     tl_only: Vec<(u32, u32)>,
+    find: Option<find_ids::Opts>,
+    diff_mnf: Option<String>,
+    diff_all_types: bool,
 }
 
 fn parse_int_arg(s: &str) -> u32 {
@@ -249,6 +257,8 @@ Options:\n  \
 --scene-name <name>  Output name for the scene .py/.json (default: derived from the world_0x.. folder)\n  \
 --scene-script-only  With --scene: don't export models, only (re)write the scene files from existing OBJs\n  \
 --scene-grid         With --scene: write <name>_grid.py instead of the placed scene: every model once, in a grid, with all of its\n                       versions stacked vertically in its cell\n  \
+--scene-water        With --scene: also build the world's water and lava as flat, untextured planes at the right height, one object per\n                       layer id in a '<scene>_water' collection (shape from terrain layer kind 6, height from the surface table 0x45 / 100).\n                       The world comes from the world_0x.. folder in the --scene path, or --scene-world\n  \
+--scene-world <id>   With --scene-water: world id, hex or decimal, when the --scene path has no world_0x.. folder\n  \
 --alliance <name>    With --scene: which version of a multi-version model starts visible, e.g. daggerfall, ebonheart, aldmeri\n                       (default: the first one). The other versions stay hidden in the same spot; unhide one in Blender to switch.\n  \
 --size-map           Write a rough zone-shape image from manifest file sizes (needs <world>; no export)\n  \
 --size-type <n>      File type (low 5 bits of Unk1) to use for --size-map (default: 0x15, cell placement files)\n  \
@@ -263,11 +273,22 @@ Options:\n  \
 --keep-lut           Export the keeps table (0x5a) and write luts/keeps_lut.csv\n \
 --item-lut           Export the item visual templates (0x58), part materials (0x50), materials (0x05) and item names (0x171) tables and write luts/items_lut.csv\n \
 --terrain-textures  Parse the terrain texture table (file id 0x29), export every texture it references into export/terrain_textures/\n                       and write luts/terrain_textures_lut.csv. Textures already exported are skipped, so it can be re-run/resumed.\n                       Archives needing fewer than 10 of the textures are exported file-by-file instead of as a whole archive\n \
+--find-ids <list>    Search every table for these layer ids (comma-separated, e.g. the water ids of terrain kind 6) and rank the columns\n                       that contain them: the lookup table that maps a terrain layer id to water type / texture / lava...\n \
+--find-legend <csv>  Same, reading the layer_id column of k<kind>_legend.csv file(s) (comma-separated). Can be combined with --find-ids\n \
+--find-yes <list> / --find-no <list>  Compare mode: ids that HAVE a property (e.g. are water) vs ids that don't (default for --find-no: every other id from --find-legend/--find-ids);\n                       lists the payload bytes that separate the two groups. Use >= 6 ids per group\n \
+--find-rows <ids>      Print those ids' rows side by side from every table (<= 5000 rows) that holds most of them, showing only the bytes that differ\n \
+--find-max-rows <n>  Compare/rows mode: skip tables with more rows than this (terrain tables are ~1000-3000; huge tables only give chance matches)\n \
+--find-same <ids>      ids that share a property (e.g. all water layers, 3+): lists table bytes where ALL of them hold the same value and that value is rare in the table\n \
+--find-table <list>  Only look in these table FileIndex values (fast re-run once you know the table)\n \
+--find-any           Probe every manifest entry, not just category 0x6xxxxxxx tables (slow)\n \
+--find-window <n>    Bytes at the start of each row to scan (default 256)\n \
+--find-top <n> / --find-dump <n>  Columns printed (default 15) / columns dumped to luts/find_ids/*.csv (default 3)\n \
 --terrain-layers <world>  Export the terrain layer table (0x44) and stitch one world into export/world_0x<id>/terrain_layers/:\n                       one k<kind>_ids.png per kind (colour = layer id) plus k<kind>_legend.csv; kind 2 is the zone map and its legend has the zone names\n \
 --terrain-layer-split <kinds|all>  With --terrain-layers: also write k<kind>_layers/id_<id>.png (one full-size mask per layer id) + index.csv
 --terrain-layer-id <kind>:<id>[,...]  With --terrain-layers: only write these ids (implies a split for their kinds)
 --world-model-lut    For EVERY world: export its placement files and write luts/worlds/world_0x<id>.csv\n  \
                        (model_id,x,y,z; sorted; from the world placement file only). Each placement file is read once.\n \
+--diff-mnf <old.mnf> Compare --mnf (the new one) with an older .mnf (or its eso_mnf.csv dump) and export every file whose Hash + Size was not in the old one;\n                       archive 0 is ignored. Written to export/mnf_diff/files/, plus export/mnf_diff/diff.csv listing them.\n                       --oodle/--dry-run apply (--dry-run only prints the counts)\n                       Only model/artwork entries (Unk1 == 0) are kept; cell, terrain, placement and table files are left out unless --diff-all-types is given. Models (.gr2) are named after their mesh instead of their index\n \
 --model-summary      Read every luts/worlds/world_0x<id>.csv and write luts/model_usage_summary.csv (each model: total count, worlds it appears in)\n                       and luts/model_manifest_entries.csv (the raw manifest line(s) for each model). Also runs automatically after --world-model-lut / --all-luts\n \
 --worlds <list>      With --world-model-lut: only these worlds (comma-separated, hex or decimal)\n \
 --with-rot           With --world-model-lut: also write rx,ry,rz columns\n \
@@ -306,6 +327,8 @@ fn parse_args() -> Args {
     let mut scene_name: Option<String> = None;
     let mut scene_script_only = false;
     let mut scene_grid = false;
+    let mut scene_water = false;
+    let mut scene_world: Option<u32> = None;
     let mut keeps = false;
     let mut keep_list = false;
     let mut keep_key = None;
@@ -320,6 +343,10 @@ fn parse_args() -> Args {
     let mut tl_world: Option<u32> = None;
     let mut tl_split: Option<Vec<u32>> = None;
     let mut tl_only: Vec<(u32, u32)> = Vec::new();
+    let mut find_on = false;
+    let mut find = find_ids::Opts::default();
+    let mut diff_mnf: Option<String> = None;
+    let mut diff_all_types = false;
 
     let mut i = 0;
     while i < raw.len() {
@@ -355,6 +382,57 @@ fn parse_args() -> Args {
             "--model-summary" => model_summary = true,
             "--terrain-textures" => terrain_textures = true,
             "--terrain-layers" => { i += 1; tl_world = Some(parse_int_arg(raw.get(i).expect("--terrain-layers needs a world id"))); }
+            "--find-ids" => {
+                i += 1;
+                let val = raw.get(i).expect("--find-ids needs a comma-separated id list");
+                find.ids.extend(val.split(',').filter(|p| !p.trim().is_empty()).map(parse_int_arg));
+                find_on = true;
+            }
+            "--find-legend" => {
+                i += 1;
+                let val = raw.get(i).expect("--find-legend needs one or more k<kind>_legend.csv paths (comma-separated)");
+                for p in val.split(',').filter(|p| !p.trim().is_empty()) {
+                    match find_ids::ids_from_legend(Path::new(p.trim())) {
+                        Ok(v) => find.ids.extend(v),
+                        Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+                    }
+                }
+                find_on = true;
+            }
+            "--find-table" => {
+                i += 1;
+                let val = raw.get(i).expect("--find-table needs a FileIndex list");
+                find.tables.extend(val.split(',').filter(|p| !p.trim().is_empty()).map(parse_int_arg));
+            }
+            "--find-yes" => {
+                i += 1;
+                let val = raw.get(i).expect("--find-yes needs a comma-separated id list");
+                find.yes.extend(val.split(',').filter(|p| !p.trim().is_empty()).map(parse_int_arg));
+                find_on = true;
+            }
+            "--find-no" => {
+                i += 1;
+                let val = raw.get(i).expect("--find-no needs a comma-separated id list");
+                find.no.extend(val.split(',').filter(|p| !p.trim().is_empty()).map(parse_int_arg));
+                find_on = true;
+            }
+            "--find-rows" => {
+                i += 1;
+                let val = raw.get(i).expect("--find-rows needs a comma-separated id list");
+                find.rows.extend(val.split(',').filter(|p| !p.trim().is_empty()).map(parse_int_arg));
+                find_on = true;
+            }
+            "--find-max-rows" => { i += 1; find.max_rows = parse_int_arg(raw.get(i).expect("--find-max-rows needs a count")) as usize; }
+            "--find-same" => {
+                i += 1;
+                let val = raw.get(i).expect("--find-same needs a comma-separated id list");
+                find.same.extend(val.split(',').filter(|p| !p.trim().is_empty()).map(parse_int_arg));
+                find_on = true;
+            }
+            "--find-any" => find.any = true,
+            "--find-window" => { i += 1; find.window = parse_int_arg(raw.get(i).expect("--find-window needs a byte count")) as usize; }
+            "--find-top" => { i += 1; find.top = parse_int_arg(raw.get(i).expect("--find-top needs a count")) as usize; }
+            "--find-dump" => { i += 1; find.dump = parse_int_arg(raw.get(i).expect("--find-dump needs a count")) as usize; }
             "--terrain-layer-split" => {
                 i += 1;
                 let val = raw.get(i).expect("--terrain-layer-split needs a kind list (6 or 6,2) or 'all'");
@@ -372,6 +450,11 @@ fn parse_args() -> Args {
                     let k = k.trim().trim_start_matches(|c| c == 'k' || c == 'K');
                     tl_only.push((parse_int_arg(k), parse_int_arg(id)));
                 }
+            }
+            "--diff-all-types" => diff_all_types = true,
+            "--diff-mnf" => {
+                i += 1;
+                diff_mnf = Some(raw.get(i).cloned().expect("--diff-mnf needs the path of the old .mnf"));
             }
             "--worlds" => {
                 i += 1;
@@ -433,6 +516,8 @@ fn parse_args() -> Args {
             }
             "--scene-script-only" => scene_script_only = true,
             "--scene-grid" => scene_grid = true,
+            "--scene-water" => scene_water = true,
+            "--scene-world" => { i += 1; scene_world = Some(parse_int_arg(raw.get(i).expect("--scene-world needs a world id"))); }
             "--alliance" => {
                 i += 1;
                 alliance = Some(raw.get(i).cloned().expect("--alliance needs a value"));
@@ -461,7 +546,7 @@ fn parse_args() -> Args {
         i += 1;
     }
 
-    let world = if !model_fis.is_empty() || !creature_ids.is_empty() || !item_models.is_empty() || !scene.is_empty() || list_worlds || world_lut || model_list || creature_list || item_list || keep_list || keeps || world_model_lut || all_luts || model_summary || terrain_textures || tl_world.is_some() {
+    let world = if !model_fis.is_empty() || !creature_ids.is_empty() || !item_models.is_empty() || !scene.is_empty() || list_worlds || world_lut || model_list || creature_list || item_list || keep_list || keeps || world_model_lut || all_luts || model_summary || terrain_textures || tl_world.is_some() || find_on || diff_mnf.is_some() {
         0
     } else {
         let world_str: &String = match positional.len() {
@@ -505,6 +590,8 @@ fn parse_args() -> Args {
         scene_name,
         scene_script_only,
         scene_grid,
+        scene_water,
+        scene_world,
         keeps,
         keep_key,
         keep_list,
@@ -519,6 +606,9 @@ fn parse_args() -> Args {
         terrain_layers: tl_world,
         tl_split,
         tl_only,
+        find: if find_on { Some(find) } else { None },
+        diff_mnf,
+        diff_all_types,
     }
 }
 
@@ -693,6 +783,45 @@ fn run_model_summary(archive: &Archive) -> Result<(), String> {
     model_summary::run(&Path::new(LUT_DIR).join("worlds"), archive, Path::new(LUT_DIR))
 }
 
+/// Surface table (0x45), keyed by terrain kind-6 layer id: lava flag (u32 at payload +37 is 3) and water surface
+/// height in game units (u32 at payload +25).
+fn surface_map(archive: &Archive) -> terrain_layers::SurfaceMap {
+    let mut out = terrain_layers::SurfaceMap::new();
+    let data = match table_match(archive, 0x45, "surface table").and_then(|m| table_bytes(archive, &m, "Surface")) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("Warning: {}; lava / water_height columns will be empty.", e); return out; }
+    };
+    let be = |o: usize| u32::from_be_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+    let mut pos = 16;
+    while pos + 32 <= data.len() && &data[pos..pos + 4] == b"####" {
+        let (key, len) = (be(pos + 20), be(pos + 28) as usize);
+        if len >= 29 && pos + 32 + len <= data.len() {
+            out.insert(key, terrain_layers::Surface {
+                water_height: be(pos + 32 + 25),
+                lava: len >= 41 && be(pos + 32 + 37) == 3,
+            });
+        }
+        pos += 32 + len;
+    }
+    out
+}
+
+/// Water and lava bodies of `world` for the Blender scene: shapes from the terrain layer table (0x44, kind 6),
+/// heights and the lava flag from the surface table (0x45).
+fn scene_water(archive: &Archive, world: u32) -> Result<Vec<terrain_layers::WaterBody>, String> {
+    let table = table_match(archive, terrain_layers::TERRAIN_LAYER_FILE_INDEX, "terrain layer table")?;
+    let data = table_bytes(archive, &table, "Terrain layer")?;
+    let surface = surface_map(archive);
+    if surface.is_empty() {
+        return Err("surface table (0x45) is not available, so there are no water heights.".to_string());
+    }
+    let bodies = terrain_layers::water_bodies(&data, world, &surface)?;
+    if bodies.is_empty() {
+        eprintln!("Warning: world 0x{:x} has no liquid layers (kind 6) in the surface table; no water written.", world);
+    }
+    Ok(bodies)
+}
+
 /// Stitch the terrain layer masks (table 0x44) of one world into export/world_0x<id>/terrain_layers/.
 /// Zone names for the kind-2 layer come from en.lang.
 fn run_terrain_layers(archive: &Archive, args: &Args, world: u32) -> Result<(), String> {
@@ -705,8 +834,9 @@ fn run_terrain_layers(archive: &Archive, args: &Args, world: u32) -> Result<(), 
         Err(e) => { eprintln!("Warning: {}", e); None }
     };
     let out_dir = Path::new(FINAL_EXPORT_DIR).join(format!("world_0x{:x}", world)).join("terrain_layers");
+    let surface = surface_map(archive);
     terrain_layers::run(&data, lang, world, &out_dir,
-        &terrain_layers::Split { kinds: args.tl_split.clone(), only: args.tl_only.clone() })
+        &terrain_layers::Split { kinds: args.tl_split.clone(), only: args.tl_only.clone() }, &surface)
 }
 
 /// Parse the terrain texture table (file id 0x29), write every texture it references to export/terrain_textures
@@ -775,6 +905,129 @@ fn run_terrain_textures(archive: &Archive, rows: &model_export::RowMap, args: &A
     let n = terrain_textures::write_lut(&entries, &files, &lut_path)?;
     println!("\nWrote {} terrain textures -> {}", n, lut_path.display());
     println!("{} of {} texture file(s) present in {}", files.len(), wanted.len(), dest.display());
+    Ok(())
+}
+
+/// `--diff-mnf <old.mnf>`: every entry of the current MNF (--mnf) whose hash + size does not occur in the old
+/// MNF (or its CSV dump), except those in archive 0 and, unless --diff-all-types, those that are not model/artwork
+/// entries (Unk1 != 0). They are written one by one to export/mnf_diff/files/<index>.<ext> (.gr2 models: <mesh name>.gr2)
+/// and listed in export/mnf_diff/diff.csv.
+fn run_mnf_diff(archive: &Archive, old_mnf: &str, args: &Args) -> Result<(), String> {
+    let dest = Path::new(FINAL_EXPORT_DIR).join("mnf_diff");
+    let files_dir = dest.join("files");
+
+    println!("Reading old manifest '{}'...", old_mnf);
+    let old = mnf_diff::load_old(Path::new(old_mnf))?;
+    let new = archive.entries();
+    println!("Old manifest: {} entries. Current manifest: {} entries.", old.len(), new.len());
+
+    let diff = mnf_diff::compare(&old, new, args.diff_all_types);
+    println!(
+        "{} new (hash + size not in the old manifest), {} already known, {} entries in archive {} ignored.",
+        diff.different.len(), diff.unchanged, diff.skipped, mnf_diff::SKIPPED_ARCHIVE
+    );
+    let excluded: usize = diff.excluded.values().sum();
+    if excluded > 0 {
+        println!("{} more new entries left out because they are not model/artwork entries (Unk1 != 0; --diff-all-types keeps them):", excluded);
+        for (cat, n) in &diff.excluded {
+            let what = match *cat {
+                0x4000 => "per-world cell files (terrain, colourmaps, LOD, cell placement)",
+                0x4400 => "world TOC",
+                0x4800 => "world placement",
+                0x6000 => "tables",
+                _ => "",
+            };
+            println!("  Unk1 0x{:04X}xxxx: {:>8}  {}", cat, n, what);
+        }
+    }
+    if diff.different.is_empty() {
+        println!("Nothing to export.");
+        return Ok(());
+    }
+
+    let (readable, unavailable): (Vec<u32>, Vec<u32>) = diff.different.iter().copied().partition(|i| {
+        new.get(*i as usize)
+            .map(|e| (e.archive_index as u32) < manifest::UNAVAILABLE_ARCHIVE_THRESHOLD)
+            .unwrap_or(false)
+    });
+    if !unavailable.is_empty() {
+        println!(
+            "{} of them are in archive {}+ (not available in the client files): they are listed but not exported.",
+            unavailable.len(), manifest::UNAVAILABLE_ARCHIVE_THRESHOLD
+        );
+    }
+
+    if args.dry_run {
+        print_plan(archive, "new", &readable);
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&files_dir).map_err(|e| format!("failed to create '{}': {}", files_dir.display(), e))?;
+
+    // entry index -> what to show in the "Exported file" column of diff.csv
+    let mut exported: HashMap<u32, String> = HashMap::new();
+    for i in &unavailable {
+        exported.insert(*i, "unavailable".to_string());
+    }
+    let (mut written, mut failed) = (0usize, 0usize);
+    let mut mesh: HashMap<u32, String> = HashMap::new(); // entry index -> mesh name of the .gr2 models
+    archive.read_each(&readable, |e, data| {
+        let res = data.and_then(|bytes| {
+            let ext = archive::guess_extension(&bytes);
+            if ext == "gr2" {
+                if let Some(n) = model_export::mesh_name(&bytes) {
+                    let n = mnf_diff::safe_file_name(&n);
+                    if !n.is_empty() {
+                        mesh.insert(e.index, n);
+                    }
+                }
+            }
+            let name = format!("{}.{}", e.index, ext);
+            std::fs::write(files_dir.join(&name), &bytes)
+                .map(|_| name)
+                .map_err(|m| format!("entry {}: write failed: {}", e.index, m))
+        });
+        match res {
+            Ok(name) => {
+                written += 1;
+                exported.insert(e.index, name);
+            }
+            Err(msg) => {
+                eprintln!("  Entry {} (archive {}) could not be exported: {}", e.index, e.archive_index, msg);
+                failed += 1;
+                exported.insert(e.index, "FAILED".to_string());
+            }
+        }
+    });
+
+    // Models: <index>.gr2 -> <mesh name>.gr2 (case-insensitively unique: when several new models share a mesh name,
+    // each gets <mesh name>_<index>.gr2).
+    let mut by_name: HashMap<String, Vec<u32>> = HashMap::new();
+    for (idx, n) in &mesh {
+        by_name.entry(n.to_lowercase()).or_default().push(*idx);
+    }
+    let mut renamed = 0usize;
+    for idxs in by_name.values() {
+        for idx in idxs {
+            let from = format!("{}.gr2", idx);
+            let to = if idxs.len() == 1 { format!("{}.gr2", mesh[idx]) } else { format!("{}_{}.gr2", mesh[idx], idx) };
+            match std::fs::rename(files_dir.join(&from), files_dir.join(&to)) {
+                Ok(()) => {
+                    exported.insert(*idx, to);
+                    renamed += 1;
+                }
+                Err(e) => eprintln!("  Could not rename {} to {}: {}", from, to, e),
+            }
+        }
+    }
+    if renamed > 0 {
+        println!("Named {} model(s) after their mesh.", renamed);
+    }
+
+    let csv_path = dest.join("diff.csv");
+    mnf_diff::write_csv(&csv_path, archive, &diff.different, &exported)?;
+    println!("\nWrote {} of {} file(s) -> {} ({} failed).", written, readable.len(), files_dir.display(), failed);
+    println!("Listed {} file(s) -> {}", diff.different.len(), csv_path.display());
     Ok(())
 }
 
@@ -887,6 +1140,16 @@ fn main() {
         return;
     }
 
+    if let Some(old_mnf) = &args.diff_mnf {
+        if let Err(e) = run_mnf_diff(&archive, old_mnf, &args) { eprintln!("{}", e); std::process::exit(1); }
+        return;
+    }
+
+    if let Some(fo) = &args.find {
+        if let Err(e) = find_ids::run(&archive, fo, Path::new(LUT_DIR)) { eprintln!("{}", e); std::process::exit(1); }
+        return;
+    }
+
     if let Some(world) = args.terrain_layers {
         if let Err(e) = run_terrain_layers(&archive, &args, world) { eprintln!("{}", e); std::process::exit(1); }
         return;
@@ -903,6 +1166,18 @@ fn main() {
             dry_run: args.dry_run,
             noesis: &args.noesis,
         };
+        let water = if args.scene_water && !args.dry_run {
+            let Some(w) = args.scene_world.or_else(|| scene_export::world_of(&args.scene)) else {
+                eprintln!("--scene-water needs the world id: pass --scene-world 0x2b (no world_0x.. folder in the --scene path).");
+                std::process::exit(1);
+            };
+            match scene_water(&archive, w) {
+                Ok(v) => v,
+                Err(e) => { eprintln!("{}", e); std::process::exit(1); }
+            }
+        } else {
+            Vec::new()
+        };
         let sa = scene_export::SceneArgs {
             inputs: &args.scene,
             cell_size: args.cell_size,
@@ -911,6 +1186,7 @@ fn main() {
             scenes_dir: &scenes_dir,
             alliance: args.alliance.as_deref(),
             grid: args.scene_grid,
+            water: &water,
         };
         match scene_export::run(&sa, &opts) {
             Ok(p) => {

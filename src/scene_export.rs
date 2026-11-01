@@ -29,6 +29,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::model_export::{self, Options};
+use crate::terrain_layers::WaterBody;
 
 #[derive(Debug, Clone)]
 struct Inst {
@@ -106,6 +107,25 @@ fn default_name(inputs: &[String]) -> String {
     "scene".to_string()
 }
 
+/// World id from a `world_0x<hex>` folder in any of the inputs (the same folders `default_name` looks for).
+pub fn world_of(inputs: &[String]) -> Option<u32> {
+    for s in inputs {
+        for c in Path::new(s).components() {
+            let c = c.as_os_str().to_string_lossy();
+            if let Some(h) = c.strip_prefix("world_0x") {
+                if let Ok(w) = u32::from_str_radix(h, 16) { return Some(w); }
+            }
+        }
+    }
+    None
+}
+
+fn water_json(water: &[WaterBody]) -> Value {
+    Value::Array(water.iter().map(|b| json!({
+        "id": b.id, "y": b.height, "lava": b.lava, "cell": b.cell, "rects": b.rects,
+    })).collect())
+}
+
 fn plain_abs(p: &Path) -> String {
     let c = fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let s = c.to_string_lossy().into_owned();
@@ -123,6 +143,8 @@ pub struct SceneArgs<'a> {
     pub alliance: Option<&'a str>,
     /// Write a viewing grid of every model (all versions stacked vertically in one cell) instead of a placed scene.
     pub grid: bool,
+    /// Water/lava bodies of the world (`terrain_layers::water_bodies`); empty = none. Placed scene only.
+    pub water: &'a [WaterBody],
 }
 
 /// One OBJ of a model: (label, file name).
@@ -249,7 +271,13 @@ pub fn run(a: &SceneArgs, mo: &Options) -> Result<PathBuf, String> {
             println!("{} placement(s) have several versions: only the first is visible, pick the right one in Blender.", placements_with_choice);
         }
         let inst_json: Vec<Value> = kept.iter().map(|i| json!([i.model, i.pos[0], i.pos[1], i.pos[2], i.rot[0], i.rot[1], i.rot[2]])).collect();
-        (base_name.clone(), BLENDER_TEMPLATE, json!({ "models": Value::Object(models), "instances": inst_json }))
+        let mut side = json!({ "models": Value::Object(models), "instances": inst_json });
+        if !a.water.is_empty() {
+            let rects: usize = a.water.iter().map(|b| b.rects.len()).sum();
+            println!("{} water/lava body(ies), {} rectangle(s), written to the scene.", a.water.len(), rects);
+            side["water"] = water_json(a.water);
+        }
+        (base_name.clone(), BLENDER_TEMPLATE, side)
     };
 
     let json_name = format!("{}.json", name);
@@ -289,6 +317,9 @@ BAKED_MODELS_DIR = @MODELS_ABS@
 SOURCE_Y_UP = True       # game data is Y-up;
 EULER_ORDER = 'XYZ'      # rotation order of rot_x/rot_y/rot_z (radians)
 UNIT_SCALE = 1.0         # multiply positions and instance size
+SHOW_WATER = True        # build the flat water/lava planes (only present when exported with --scene-water)
+WATER_Y_OFFSET = 0.0     # raise (+) or lower (-) every water plane, in game units, e.g. to stop it z-fighting with terrain
+WATER_FLIP_Z = False     # mirror the water north-south if it comes out flipped relative to the placed models
 LIMIT = 0                # >0: only place the first N instances
 LIBRARY_GRID = True      # lay the library models out in a grid so you can inspect them; instances still line up
 GAP = 0.15               # grid: space between neighbouring cells, as a fraction of the largest model
@@ -621,6 +652,70 @@ for n, (fid, px, py, pz, rx, ry, rz) in enumerate(insts):
         with_choice += 1
     count += 1
 
+def water_material(lava):
+    name = 'scene_flat_lava' if lava else 'scene_flat_water'
+    m = bpy.data.materials.get(name)
+    if m is not None:
+        return m
+    m = bpy.data.materials.new(name)
+    m.use_nodes = True
+    col = (1.0, 0.22, 0.02, 1.0) if lava else (0.05, 0.28, 0.55, 0.7)
+    m.diffuse_color = col
+    bsdf = m.node_tree.nodes.get('Principled BSDF') if m.node_tree else None
+    if bsdf is not None:
+        bsdf.inputs['Base Color'].default_value = col
+        if lava:
+            for key in ('Emission Color', 'Emission'):
+                if key in bsdf.inputs:
+                    bsdf.inputs[key].default_value = col
+                    break
+            if 'Emission Strength' in bsdf.inputs:
+                bsdf.inputs['Emission Strength'].default_value = 2.0
+        else:
+            bsdf.inputs['Alpha'].default_value = col[3]
+    if not lava:
+        set_alpha_mode(m, 'blend')
+    return m
+
+
+def build_water():
+    """One flat, untextured mesh per water/lava body (a layer id), at its surface height, all in '<scene>_water'."""
+    bodies = data.get('water') or []
+    if not bodies or not SHOW_WATER:
+        return
+    col = bpy.data.collections.new('%s_water' % SCENE_NAME)
+    bpy.context.scene.collection.children.link(col)
+    zs = [r[k] * b['cell'] for b in bodies for r in b['rects'] for k in (1, 3)]
+    zsum = min(zs) + max(zs)
+    made = 0
+    for b in bodies:
+        cell, y = b['cell'], b['y'] + WATER_Y_OFFSET
+        verts, faces = [], []
+        for x0, z0, x1, z1 in b['rects']:
+            quad = []
+            for gx, gz in ((x0, z0), (x0, z1), (x1, z1), (x1, z0)):
+                gx, gz = gx * cell, gz * cell
+                if WATER_FLIP_Z:
+                    gz = zsum - gz
+                quad.append(tuple((C @ Vector((gx, y, gz))) * UNIT_SCALE))
+            area = sum(quad[i][0] * quad[(i + 1) % 4][1] - quad[(i + 1) % 4][0] * quad[i][1] for i in range(4))
+            if area < 0:
+                quad.reverse()      # keep every face pointing up
+            base = len(verts)
+            verts.extend(quad)
+            faces.append((base, base + 1, base + 2, base + 3))
+        name = '%s_%d_y%s' % ('lava' if b['lava'] else 'water', b['id'], ('%.2f' % b['y']).rstrip('0').rstrip('.'))
+        me = bpy.data.meshes.new(name)
+        me.from_pydata(verts, [], faces)
+        me.update()
+        me.materials.append(water_material(b['lava']))
+        ob = bpy.data.objects.new(name, me)
+        col.objects.link(ob)
+        made += 1
+    print('Built %d water/lava plane object(s) in %s_water.' % (made, SCENE_NAME))
+
+
+build_water()
 print('Placed %d instance(s) of %d model(s); %d placement(s) have several versions (one visible, the rest hidden in place).' % (count, len(lib), with_choice))
 "#;
 

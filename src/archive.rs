@@ -113,14 +113,14 @@ impl Archive {
         let hits: Vec<&MnfFileEntry> = self.entries().iter()
             .filter(|e| self.name(e).map(is_en).unwrap_or(false))
             .collect();
-        let Some(first) = hits.first() else {
+        let Some(last) = hits.last() else {
             return Err("en.lang was not found in the archive (no ZOSFT name matches)".to_string());
         };
         if hits.len() > 1 {
             eprintln!("Warning: {} entries are named en.lang ({}); using the first (index {}).",
-                hits.len(), hits.iter().map(|e| e.index.to_string()).collect::<Vec<_>>().join(", "), first.index);
+                hits.len(), hits.iter().map(|e| e.index.to_string()).collect::<Vec<_>>().join(", "), last.index);
         }
-        let bytes = self.read(first.index)?;
+        let bytes = self.read(last.index)?;
         let mut lang = eso_common::lang::EsoLangFile::new();
         lang.parse_data(&bytes).map_err(|e| format!("en.lang: {}", e))?;
 
@@ -132,6 +132,25 @@ impl Archive {
             t.by_group.entry(r.id as i32).or_default().insert(r.index, text);
         }
         Ok(t)
+    }
+}
+
+/// Just the file table of an .mnf (no ZOSFT, no Oodle, no DAT access): enough to compare manifests.
+pub fn load_entries(mnf_path: &Path) -> Result<Vec<MnfFileEntry>, String> {
+    let mut mnf = MnfFile::new();
+    mnf.load(&mnf_path.to_string_lossy())
+        .map_err(|e| format!("Failed to load '{}': {}", mnf_path.display(), e))?;
+    Ok(mnf.file_table().to_vec())
+}
+
+/// File extension (without the dot) for the bytes of an exported entry; `bin` when it is not recognised.
+#[allow(clippy::ptr_arg)]
+pub fn guess_extension(bytes: &Vec<u8>) -> String {
+    let ext = guess_file_extension(bytes);
+    if ext.is_empty() || !ext.chars().all(|c| c.is_ascii_alphanumeric()) {
+        "bin".to_string()
+    } else {
+        ext.to_string()
     }
 }
 
