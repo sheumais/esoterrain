@@ -759,7 +759,7 @@ fn run_core_luts(archive: &Archive, rows: &model_export::RowMap, args: &Args) ->
     if let Err(e) = build_model_lut(archive, &model_m) { errors.push(e); }
     if let Err(e) = build_creature_lut(archive, &creature_set) { errors.push(e); }
     if let Err(e) = build_item_lut(archive, rows, &item_set, args) { errors.push(e); }
-    if let Err(e) = build_keep_lut(archive, &keep_m) { errors.push(e); }
+    // if let Err(e) = build_keep_lut(archive, &keep_m) { errors.push(e); }
 
     if errors.is_empty() { Ok(()) } else { Err(errors.join("\n")) }
 }
